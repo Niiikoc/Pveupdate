@@ -45,7 +45,7 @@ LOG_PATH = os.environ.get("PVEUPDATE_LOG", "/var/log/pveupdate.log")
 LOCK_PATH = os.environ.get("PVEUPDATE_LOCK", "/run/pveupdate.lock")
 TOKEN_PATH = os.environ.get("PVEUPDATE_TOKEN", "/etc/pveupdate.token")
 SNAP_PREFIX = "pveupd"
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 EXEC_TIMEOUT = 3600
 
 DEFAULTS = {
@@ -99,11 +99,25 @@ fi
 REBOOT_CHECK = "test -f /var/run/reboot-required && echo yes || echo no"
 
 # Line 1: reboot needed (yes/no). Line 2: OS name and version, e.g. "Debian 12.11".
+# Line 3: the OS version pending updates will bring, if they change it.
+# Run after OS_CHECK, so the package lists are fresh.
 GUEST_INFO = REBOOT_CHECK + r"""
 [ -r /etc/os-release ] && . /etc/os-release
 v=$VERSION_ID
 [ "$ID" = debian ] && [ -r /etc/debian_version ] && v=$(cat /etc/debian_version)
 echo "${NAME%% *} $v"
+new=""
+if [ "$ID" = debian ] && apt list --upgradable 2>/dev/null | grep -q '^base-files/'; then
+  # The point release is in the new base-files package's /etc/debian_version.
+  d=$(mktemp -d) && (cd "$d" && apt-get download -qq base-files >/dev/null 2>&1 &&
+    dpkg-deb --fsys-tarfile base-files_*.deb | tar -xO ./etc/debian_version) > "$d/v" 2>/dev/null &&
+    new=$(cat "$d/v")
+  rm -rf "$d"
+elif [ "$ID" = alpine ]; then
+  new=$(apk list -u alpine-release 2>/dev/null | sed -n 's/^alpine-release-\([0-9.]*\)-r.*/\1/p' | head -n1)
+fi
+[ -n "$new" ] && [ "$new" != "$v" ] && echo "${NAME%% *} $new"
+true
 """
 
 # Prints the URL of the community-scripts ct script this container was made from.
@@ -553,6 +567,8 @@ def check_guest(cfg, gid):
     res["reboot_required"] = bool(lines) and lines[0] == "yes"
     if len(lines) > 1 and lines[1].strip():
         res["os"] = lines[1].strip()
+    if len(lines) > 2 and lines[2].strip():
+        res["os_latest"] = lines[2].strip()
     app = g.get("app")
     if app:
         # Containers tracked before script detection existed: detect once now.
@@ -748,6 +764,7 @@ def status_summary(cfg, st, full=False):
             "type": cfg["guests"][gid]["type"],
             "state": e.get("state", "unchecked"),
             "os": e.get("os"),
+            "os_latest": e.get("os_latest"),
             "packages": e.get("packages", 0),
             "app": app.get("label"),
             "app_installed": app.get("installed"),
