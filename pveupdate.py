@@ -45,7 +45,7 @@ LOG_PATH = os.environ.get("PVEUPDATE_LOG", "/var/log/pveupdate.log")
 LOCK_PATH = os.environ.get("PVEUPDATE_LOCK", "/run/pveupdate.lock")
 TOKEN_PATH = os.environ.get("PVEUPDATE_TOKEN", "/etc/pveupdate.token")
 SNAP_PREFIX = "pveupd"
-VERSION = "0.4.1"
+VERSION = "0.5.0"
 EXEC_TIMEOUT = 3600
 
 DEFAULTS = {
@@ -151,6 +151,17 @@ def run(cmd, check=True):
     return subprocess.run(cmd, capture_output=True, text=True, check=check)
 
 
+def run_stream(cmd, on_line):
+    """Run cmd, calling on_line(line) for each output line as it arrives.
+    Returns (exit_code, combined_output)."""
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
+    out = []
+    for line in p.stdout:
+        out.append(line)
+        on_line(line)
+    return p.wait(), "".join(out)
+
+
 def ask(prompt, default=True):
     suffix = " [Y/n] " if default else " [y/N] "
     ans = input(prompt + suffix).strip().lower()
@@ -251,11 +262,12 @@ def list_guests():
     return dict(sorted(out.items(), key=lambda kv: int(kv[0])))
 
 
-def guest_exec(gtype, gid, script, env=None, interactive=False):
+def guest_exec(gtype, gid, script, env=None, interactive=False, on_line=None):
     """Run a shell script inside a guest. Returns (exit_code, stdout, stderr).
 
     interactive=True (LXC only) connects the command to your terminal so its
-    output streams live and prompts can be answered.
+    output streams live and prompts can be answered. on_line (LXC only) is
+    called with each output line as it arrives, for progress.
     """
     if env:
         script = "".join(f"export {k}={shlex.quote(str(v))}\n" for k, v in env.items()) + script
@@ -263,6 +275,9 @@ def guest_exec(gtype, gid, script, env=None, interactive=False):
         cmd = ["pct", "exec", gid, "--", "sh", "-c", script]
         if interactive:
             return subprocess.call(cmd), "", ""
+        if on_line:
+            code, out = run_stream(cmd, on_line)
+            return code, out, ""
         r = run(cmd, check=False)
         return r.returncode, r.stdout, r.stderr
     # VM via QEMU guest agent (never interactive)
@@ -305,18 +320,19 @@ def backup_storage(cfg, gid):
     return active[0][0] if active else None
 
 
-def take_backup(cfg, gtype, gid):
+def take_backup(cfg, gtype, gid, on_line=None):
     """vzdump fallback for guests that can't be snapshotted. Returns (storage, error)."""
     storage = backup_storage(cfg, gid)
     if not storage:
         return None, "no storage with backup content found (set one with `pveupdate set default --backup-storage NAME`)"
     say(f"  snapshot not possible, taking a backup to {storage} instead (this can take a while)...")
-    r = run(["vzdump", gid, "--storage", storage, "--mode", "snapshot", "--compress", "zstd",
-             "--notes-template", BACKUP_NOTE, "--prune-backups", "keep-all=1"], check=False)
-    log(r.stdout + r.stderr)
-    if r.returncode != 0:
-        lines = (r.stderr or r.stdout).strip().splitlines()
-        return None, lines[-1] if lines else f"vzdump exit {r.returncode}"
+    code, out = run_stream(["vzdump", gid, "--storage", storage, "--mode", "snapshot", "--compress", "zstd",
+                            "--notes-template", BACKUP_NOTE, "--prune-backups", "keep-all=1"],
+                           on_line or (lambda line: None))
+    log(out)
+    if code != 0:
+        lines = out.strip().splitlines()
+        return None, lines[-1] if lines else f"vzdump exit {code}"
     return storage, None
 
 
@@ -623,11 +639,46 @@ def cmd_check(cfg, args):
     return results
 
 
-def update_guest(cfg, gid, opts):
-    """Returns (result, detail). result: ok | reboot | failed | skipped."""
+# Share of a guest's update each step takes, for the progress percentage.
+PROGRESS_BACKUP = (0, 20)
+PROGRESS_OS = (20, 80)
+PROGRESS_APP = (80, 98)
+
+
+def apt_counter(total, span, progress, step):
+    """on_line callback: moves progress through span as apt downloads,
+    unpacks and sets up about `total` packages."""
+    lo, hi = span
+    seen = [0]
+    events = max(total, 1) * 3  # Get:, Unpacking, Setting up
+
+    def on_line(line):
+        if line.startswith(("Get:", "Unpacking ", "Setting up ")):
+            seen[0] += 1
+            progress(lo + (hi - lo) * min(seen[0] / events, 0.99), step)
+    return on_line
+
+
+def percent_counter(span, progress, step):
+    """on_line callback for output with "NN%" progress (vzdump)."""
+    lo, hi = span
+
+    def on_line(line):
+        m = re.search(r"\b(\d{1,3})%", line)
+        if m and int(m.group(1)) <= 100:
+            progress(lo + (hi - lo) * int(m.group(1)) / 100, step)
+    return on_line
+
+
+def update_guest(cfg, gid, opts, progress=None):
+    """Returns (result, detail). result: ok | reboot | failed | skipped.
+
+    progress(percent, step) is called as the update moves along.
+    """
     g = cfg["guests"][gid]
     gtype = g["type"]
     interactive = not opts.non_interactive
+    progress = progress or (lambda percent, step: None)
     say(f"\n== {gid} {g['name']} ==")
     log(f"\n== {now()} {gid} {g['name']} ==")
     if not is_running(gtype, gid):
@@ -635,6 +686,7 @@ def update_guest(cfg, gid, opts):
         return "skipped", "stopped"
 
     if setting(cfg, gid, "snapshot") and not opts.no_snapshot:
+        progress(PROGRESS_BACKUP[0], "snapshot")
         snap, err = take_snapshot(gtype, gid)
         if snap:
             say(ok(f"  snapshot {snap}"))
@@ -645,7 +697,8 @@ def update_guest(cfg, gid, opts):
             log(f"snapshot failed: {err}")
             storage, berr = (None, "backup fallback is off")
             if setting(cfg, gid, "backup_fallback"):
-                storage, berr = take_backup(cfg, gtype, gid)
+                progress(PROGRESS_BACKUP[0], "backup")
+                storage, berr = take_backup(cfg, gtype, gid, percent_counter(PROGRESS_BACKUP, progress, "backup"))
             if storage:
                 say(ok(f"  backup saved to {storage}"))
                 log(f"backup saved to {storage}")
@@ -656,9 +709,10 @@ def update_guest(cfg, gid, opts):
                 if not interactive or not ask("  Continue without a snapshot or backup?", default=False):
                     return "skipped", f"no snapshot ({err}) or backup ({berr})"
 
-    def step(script, env=None):
+    def step(script, env=None, on_line=None):
         live = interactive and gtype == "lxc"
-        code, out, err = guest_exec(gtype, gid, script, env=env, interactive=live)
+        code, out, err = guest_exec(gtype, gid, script, env=env, interactive=live,
+                                    on_line=None if live or gtype != "lxc" else on_line)
         if not live:
             log(out + err)
             if interactive:
@@ -666,7 +720,10 @@ def update_guest(cfg, gid, opts):
         return code
 
     say("  updating OS packages...")
-    code = step(g.get("os_cmd") or OS_UPGRADE, {"AUTOREMOVE": 1 if setting(cfg, gid, "autoremove") else 0})
+    progress(PROGRESS_OS[0], "os")
+    npkg = (load_status()["guests"].get(gid) or {}).get("packages") or 1
+    code = step(g.get("os_cmd") or OS_UPGRADE, {"AUTOREMOVE": 1 if setting(cfg, gid, "autoremove") else 0},
+                apt_counter(npkg, PROGRESS_OS, progress, "os"))
     if code != 0:
         say(bad(f"  OS update failed (exit {code})"))
         return "failed", f"OS update failed (exit {code})"
@@ -675,6 +732,7 @@ def update_guest(cfg, gid, opts):
     app = g.get("app")
     if app and not opts.no_app:
         say(f"  running app update: {app['cmd']}")
+        progress(PROGRESS_APP[0], "app")
         # PHS_SILENT=1 makes community-scripts `update` skip its menu.
         code = step(app["cmd"], None if interactive else {"PHS_SILENT": 1})
         if code != 0:
@@ -682,6 +740,7 @@ def update_guest(cfg, gid, opts):
             return "failed", f"app update failed (exit {code})"
         say(ok("  app updated"))
 
+    progress(PROGRESS_APP[1], "finishing")
     _, out, _ = guest_exec(gtype, gid, REBOOT_CHECK)
     if out.strip() == "yes":
         say(warn("  reboot required"))
@@ -723,6 +782,8 @@ def cmd_update(cfg, args):
         st.pop("activity", None)
         st.pop("updating", None)
         st.pop("queue", None)
+        st.pop("progress", None)
+        st.pop("step", None)
         save_json(STATUS_PATH, st)
         lock.close()
 
@@ -740,9 +801,19 @@ def cmd_update(cfg, args):
 def _update_all(cfg, args, ids, st, results):
     for i, gid in enumerate(ids):
         # Progress for Home Assistant: which guest is updating, which are queued.
-        st.update(activity="updating", updating=gid, queue=ids[i + 1:])
+        st.update(activity="updating", updating=gid, queue=ids[i + 1:], progress=0, step="starting")
         save_json(STATUS_PATH, st)
-        result, detail = update_guest(cfg, gid, args)
+        last = [0.0]
+
+        def progress(percent, step):
+            percent = int(percent)
+            # Save at most every 2 seconds, or when the step changes.
+            if step != st.get("step") or (percent != st.get("progress") and time.monotonic() - last[0] > 2):
+                st.update(progress=percent, step=step)
+                save_json(STATUS_PATH, st)
+                last[0] = time.monotonic()
+
+        result, detail = update_guest(cfg, gid, args, progress)
         results[gid] = (result, detail)
         entry = st["guests"].setdefault(gid, {"name": cfg["guests"][gid]["name"], "type": cfg["guests"][gid]["type"]})
         entry.update(last_update=now(), last_result=result, last_detail=detail,
@@ -789,6 +860,10 @@ def status_summary(cfg, st, full=False):
         "activity": st.get("activity") if running else None,
         "updating": st.get("updating") if running else None,
         "queue": st.get("queue", []) if running else [],
+        # Progress of the guest being updated: percent and step
+        # (snapshot, backup, os, app, finishing).
+        "progress": st.get("progress") if running and st.get("updating") else None,
+        "step": st.get("step") if running and st.get("updating") else None,
         "pending_guests": sum(1 for g in guests.values() if g["pending"]),
         "pending_ids": " ".join(gid for gid, g in guests.items() if g["pending"]),
         "guests": guests,
