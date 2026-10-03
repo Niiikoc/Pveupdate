@@ -22,6 +22,7 @@ pveupdate update       # check, then asks which guests to update
 pveupdate update 101 105
 pveupdate update pending   # every guest the last check found updates for
 pveupdate status       # results of the last check and update, without re-checking
+pveupdate serve        # HTTP API for the Home Assistant integration (see below)
 ```
 
 Adding and removing guests:
@@ -62,7 +63,20 @@ MariaDB, InfluxDB and other apt-installed apps are covered by the OS step.
 
 ## Home Assistant
 
-Home Assistant can show what's pending, notify you, and start updates with a button. It talks to the Proxmox host over SSH with a key that can **only** run pveupdate (`status`, `check`, `update`, `log`), nothing else.
+The recommended way is the **[Proxmox Guest Updates](https://github.com/Niiikoc/ha-pveupdate)** integration (installable through HACS). Each tracked guest shows up as a Home Assistant update entity with an Install button. It talks to `pveupdate serve`, a small token-protected API on the host:
+
+```bash
+base=https://raw.githubusercontent.com/Niiikoc/Pveupdate/main
+curl -fsSL $base/systemd/pveupdate-serve.service -o /etc/systemd/system/pveupdate-serve.service
+systemctl daemon-reload && systemctl enable --now pveupdate-serve
+pveupdate token      # enter this in the integration
+```
+
+The API (port 8765) accepts only: read status, start a check, update tracked guests, read the log. Every request needs the token. Keep the port on your LAN, and replace the token with `pveupdate token --new`.
+
+### Without the integration (SSH + YAML)
+
+This uses an SSH key that can **only** run pveupdate (`status`, `check`, `update`, `log`), nothing else.
 
 **1. On the Proxmox host**, install the remote wrapper and a timer that checks every 6 hours (checking is read-only; updates still only happen when you press the button):
 
@@ -127,3 +141,4 @@ Files on the host:
 | `/etc/pveupdate.json` | tracked guests and settings |
 | `/var/lib/pveupdate/status.json` | last check and update results |
 | `/var/log/pveupdate.log` | output of updates run without a terminal |
+| `/etc/pveupdate.token` | API token for `pveupdate serve` |

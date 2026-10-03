@@ -1,0 +1,14 @@
+[Unit]
+Description=pveupdate API for the Home Assistant integration
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/pveupdate serve
+Restart=on-failure
+# Updates started by the API run as their own processes and must survive a
+# restart of this service.
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target

@@ -15,6 +15,8 @@ Usage:
   pveupdate.py update [ID ...]  snapshot + update the given guests (asks if no IDs)
                                 IDs can also be `all` or `pending`
   pveupdate.py status           show the result of the last check/update
+  pveupdate.py serve            HTTP API for the Home Assistant integration
+  pveupdate.py token            print the API token
   pveupdate.py set ID [options] change a guest's settings (see `set --help`)
 
 For Home Assistant / remote use see pveupdate-remote and the README.
@@ -23,20 +25,27 @@ For Home Assistant / remote use see pveupdate-remote and the README.
 import argparse
 import datetime as dt
 import fcntl
+import hmac
 import json
 import os
 import re
+import secrets
 import shlex
 import socket
 import subprocess
 import sys
+import threading
+import time
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 CONFIG_PATH = os.environ.get("PVEUPDATE_CONFIG", "/etc/pveupdate.json")
 STATUS_PATH = os.environ.get("PVEUPDATE_STATUS", "/var/lib/pveupdate/status.json")
 LOG_PATH = os.environ.get("PVEUPDATE_LOG", "/var/log/pveupdate.log")
 LOCK_PATH = os.environ.get("PVEUPDATE_LOCK", "/run/pveupdate.lock")
+TOKEN_PATH = os.environ.get("PVEUPDATE_TOKEN", "/etc/pveupdate.token")
 SNAP_PREFIX = "pveupd"
+VERSION = "0.3.0"
 EXEC_TIMEOUT = 3600
 
 DEFAULTS = {"snapshot": True, "keep_snapshots": 3, "autoremove": True}
@@ -515,6 +524,8 @@ def cmd_check(cfg, args):
         return {}
     lock = acquire_lock()
     st = load_status()
+    st["activity"] = "checking"
+    save_json(STATUS_PATH, st)
     say("Checking (read-only)...\n")
     results = {}
     for gid in ids:
@@ -525,6 +536,7 @@ def cmd_check(cfg, args):
         if not QUIET:
             print_check_line(gid, res, args.verbose)
     st["checked_at"] = now()
+    st.pop("activity", None)
     save_json(STATUS_PATH, st)
     lock.close()
     if getattr(args, "json", False):
@@ -616,17 +628,14 @@ def cmd_update(cfg, args):
     lock = acquire_lock()
     st = load_status()
     results = {}
-    for gid in ids:
-        result, detail = update_guest(cfg, gid, args)
-        results[gid] = (result, detail)
-        entry = st["guests"].setdefault(gid, {"name": cfg["guests"][gid]["name"], "type": cfg["guests"][gid]["type"]})
-        entry.update(last_update=now(), last_result=result, last_detail=detail,
-                     reboot_required=(result == "reboot"))
-        if result in ("ok", "reboot"):
-            entry.update(check_guest(cfg, gid))  # refresh pending counts
+    try:
+        _update_all(cfg, args, ids, st, results)
+    finally:
+        st.pop("activity", None)
+        st.pop("updating", None)
+        st.pop("queue", None)
         save_json(STATUS_PATH, st)
-        log(f"result: {result} {detail}")
-    lock.close()
+        lock.close()
 
     say("\nSummary:")
     for gid, (res, detail) in results.items():
@@ -637,6 +646,22 @@ def cmd_update(cfg, args):
         print(json.dumps(status_summary(cfg, st), indent=2))
     if any(r == "failed" for r, _ in results.values()):
         sys.exit(1)
+
+
+def _update_all(cfg, args, ids, st, results):
+    for i, gid in enumerate(ids):
+        # Progress for Home Assistant: which guest is updating, which are queued.
+        st.update(activity="updating", updating=gid, queue=ids[i + 1:])
+        save_json(STATUS_PATH, st)
+        result, detail = update_guest(cfg, gid, args)
+        results[gid] = (result, detail)
+        entry = st["guests"].setdefault(gid, {"name": cfg["guests"][gid]["name"], "type": cfg["guests"][gid]["type"]})
+        entry.update(last_update=now(), last_result=result, last_detail=detail,
+                     reboot_required=(result == "reboot"))
+        if result in ("ok", "reboot"):
+            entry.update(check_guest(cfg, gid))  # refresh pending counts
+        save_json(STATUS_PATH, st)
+        log(f"result: {result} {detail}")
 
 
 def status_summary(cfg, st, full=False):
@@ -664,9 +689,14 @@ def status_summary(cfg, st, full=False):
             guests[gid]["error"] = e["error"]
         if full:
             guests[gid]["package_names"] = e.get("package_names", [])
+    running = is_locked()
     return {
+        "version": VERSION,
         "checked_at": st.get("checked_at"),
-        "running": is_locked(),
+        "running": running,
+        "activity": st.get("activity") if running else None,
+        "updating": st.get("updating") if running else None,
+        "queue": st.get("queue", []) if running else [],
         "pending_guests": sum(1 for g in guests.values() if g["pending"]),
         "pending_ids": " ".join(gid for gid, g in guests.items() if g["pending"]),
         "guests": guests,
@@ -714,6 +744,130 @@ def cmd_set(cfg, args):
     print(json.dumps({args.id: g}, indent=2))
 
 
+# ---------------------------------------------------------------- HTTP API
+
+def load_token(create=False):
+    if os.path.exists(TOKEN_PATH):
+        with open(TOKEN_PATH) as f:
+            return f.read().strip()
+    if not create:
+        return None
+    token = secrets.token_urlsafe(32)
+    fd = os.open(TOKEN_PATH, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(token + "\n")
+    return token
+
+
+def spawn(*cli_args):
+    """Run pveupdate in the background, detached from the API server."""
+    subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), *cli_args],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+class ApiHandler(BaseHTTPRequestHandler):
+    token = ""
+    start_lock = threading.Lock()
+    last_start = 0.0
+    server_version = "pveupdate"
+
+    def log_message(self, fmt, *a):
+        pass
+
+    def _send(self, code, body):
+        data = json.dumps(body).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _authorized(self):
+        auth = self.headers.get("Authorization", "")
+        given = auth[7:] if auth.startswith("Bearer ") else ""
+        if given and hmac.compare_digest(given, self.token):
+            return True
+        self._send(401, {"error": "invalid or missing token"})
+        return False
+
+    def _body(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        if not n:
+            return {}
+        try:
+            return json.loads(self.rfile.read(min(n, 65536)))
+        except ValueError:
+            return None
+
+    def do_GET(self):
+        if not self._authorized():
+            return
+        path = self.path.split("?", 1)[0]
+        if path == "/api/status":
+            self._send(200, status_summary(load_config(), load_status(), full=True))
+        elif path == "/api/log":
+            try:
+                with open(LOG_PATH) as f:
+                    lines = f.readlines()[-200:]
+            except OSError:
+                lines = []
+            self._send(200, {"log": "".join(lines)})
+        else:
+            self._send(404, {"error": "not found"})
+
+    def do_POST(self):
+        if not self._authorized():
+            return
+        path = self.path.split("?", 1)[0]
+        if path not in ("/api/check", "/api/update"):
+            self._send(404, {"error": "not found"})
+            return
+        with ApiHandler.start_lock:
+            # The started process takes the run lock a moment later, so also
+            # refuse a second start within a few seconds of the last one.
+            if is_locked() or time.monotonic() - ApiHandler.last_start < 5:
+                self._send(409, {"error": "a check or update is already running"})
+                return
+            self._start(path)
+
+    def _start(self, path):
+        if path == "/api/check":
+            spawn("check", "--json")
+            ApiHandler.last_start = time.monotonic()
+            self._send(202, {"started": "check"})
+            return
+        body = self._body()
+        guests = (body or {}).get("guests")
+        cfg = load_config()
+        if guests in ("all", "pending"):
+            ids = [guests]
+        elif isinstance(guests, list) and guests and all(str(g) in cfg["guests"] for g in guests):
+            ids = [str(g) for g in guests]
+        else:
+            self._send(400, {"error": "guests must be 'all', 'pending' or a list of tracked guest IDs"})
+            return
+        spawn("update", "--non-interactive", *ids)
+        ApiHandler.last_start = time.monotonic()
+        self._send(202, {"started": "update", "guests": ids})
+
+
+def cmd_serve(cfg, args):
+    token = load_token(create=True)
+    ApiHandler.token = token
+    server = ThreadingHTTPServer((args.bind, args.port), ApiHandler)
+    print(f"pveupdate API listening on {args.bind}:{args.port} (token in {TOKEN_PATH})", flush=True)
+    server.serve_forever()
+
+
+def cmd_token(cfg, args):
+    if args.new and os.path.exists(TOKEN_PATH):
+        os.remove(TOKEN_PATH)
+    print(load_token(create=True))
+
+
 def menu(cfg):
     while True:
         print("\n1) Check for updates   2) Update guests   3) Choose tracked guests   4) List tracked   q) Quit")
@@ -752,6 +906,11 @@ def main():
     pu.add_argument("--no-snapshot", action="store_true")
     pu.add_argument("--no-app", action="store_true", help="only OS packages")
     pu.add_argument("--json", action="store_true", help="print status JSON instead of text")
+    psv = sub.add_parser("serve", help="run the HTTP API for the Home Assistant integration")
+    psv.add_argument("--bind", default="0.0.0.0")
+    psv.add_argument("--port", type=int, default=8765)
+    ptk = sub.add_parser("token", help="print the API token (created on first use)")
+    ptk.add_argument("--new", action="store_true", help="replace the token with a new one")
     pst = sub.add_parser("status", help="show the last check/update results")
     pst.add_argument("--json", action="store_true")
     pst.add_argument("-v", "--verbose", action="store_true", help="include package names")
@@ -771,7 +930,7 @@ def main():
     QUIET = bool(getattr(args, "json", False) or getattr(args, "non_interactive", False))
     cfg = load_config()
     handlers = {"track": cmd_track, "untrack": cmd_untrack, "list": cmd_list, "check": cmd_check, "update": cmd_update,
-                "status": cmd_status, "set": cmd_set}
+                "status": cmd_status, "set": cmd_set, "serve": cmd_serve, "token": cmd_token}
     try:
         if args.command:
             handlers[args.command](cfg, args)
