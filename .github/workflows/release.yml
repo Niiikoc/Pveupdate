@@ -1,10 +1,11 @@
 name: Release
 
-# Publishing a release on GitHub (tag vX.Y.Z) attaches pveupdate.py and the
-# systemd units. The install commands download from the latest release.
+# Every push to main whose VERSION has no release yet publishes one: tag
+# vX.Y.Z, generated notes, and pveupdate.py plus the systemd units attached.
+# Merges that don't change VERSION publish nothing.
 on:
-  release:
-    types: [published]
+  push:
+    branches: [main]
 
 permissions:
   contents: write
@@ -14,16 +15,25 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Tag matches VERSION
-        run: |
-          tag="${GITHUB_REF_NAME#v}"
-          version=$(sed -n 's/^VERSION = "\(.*\)"/\1/p' pveupdate.py)
-          if [ "$tag" != "$version" ]; then
-            echo "::error::Release tag $GITHUB_REF_NAME does not match VERSION $version in pveupdate.py"
-            exit 1
-          fi
-      - run: python3 -m py_compile pveupdate.py
-      - name: Attach files
+      - name: Read VERSION
+        id: version
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "$GITHUB_REF_NAME" pveupdate.py systemd/*.service systemd/*.timer --clobber
+        run: |
+          version=$(sed -n 's/^VERSION = "\(.*\)"/\1/p' pveupdate.py)
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          if gh release view "v$version" >/dev/null 2>&1; then
+            echo "v$version is already released, nothing to do"
+            echo "new=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "new=true" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.version.outputs.new == 'true'
+        run: python3 -m py_compile pveupdate.py
+      - if: steps.version.outputs.new == 'true'
+        name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.version.outputs.tag }}" --target "$GITHUB_SHA" --generate-notes \
+            pveupdate.py systemd/*.service systemd/*.timer
