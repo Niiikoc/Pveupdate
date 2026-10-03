@@ -46,7 +46,7 @@ LOG_PATH = os.environ.get("PVEUPDATE_LOG", "/var/log/pveupdate.log")
 LOCK_PATH = os.environ.get("PVEUPDATE_LOCK", "/run/pveupdate.lock")
 TOKEN_PATH = os.environ.get("PVEUPDATE_TOKEN", "/etc/pveupdate.token")
 SNAP_PREFIX = "pveupd"
-VERSION = "0.5.2"
+VERSION = "0.5.3"
 EXEC_TIMEOUT = 3600
 
 DEFAULTS = {
@@ -90,6 +90,8 @@ OS_UPGRADE = r"""
 set -e
 if command -v apt-get >/dev/null; then
   export DEBIAN_FRONTEND=noninteractive
+  # Finish any package install that was interrupted earlier, or apt refuses to run.
+  dpkg --configure -a --force-confdef --force-confold
   apt-get update -qq
   apt-get -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold dist-upgrade
   [ "$AUTOREMOVE" = 1 ] && apt-get -y autoremove --purge || true
