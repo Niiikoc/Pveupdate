@@ -6,12 +6,12 @@ Check and update selected Proxmox LXCs and VMs, only when you ask. Runs on the P
 
 ```bash
 # on the Proxmox host
-curl -fsSL https://raw.githubusercontent.com/Niiikoc/Pveupdate/main/pveupdate.py -o /usr/local/bin/pveupdate
+curl -fsSL https://github.com/Niiikoc/Pveupdate/releases/latest/download/pveupdate.py -o /usr/local/bin/pveupdate
 chmod +x /usr/local/bin/pveupdate
 pveupdate track      # pick the guests to manage
 ```
 
-Run the same `curl` again to update pveupdate itself.
+Run the same `curl` again to update pveupdate itself. It always fetches the latest [release](https://github.com/Niiikoc/Pveupdate/releases), never unreleased work in progress.
 
 ## Use
 
@@ -66,8 +66,8 @@ MariaDB, InfluxDB and other apt-installed apps are covered by the OS step.
 Use the **[Proxmox Guest Updates](https://github.com/Niiikoc/ha-pveupdate)** integration (installable through HACS). Each tracked guest shows up as a Home Assistant update entity with an Install button, and you can choose the tracked guests under the integration's Configure. It talks to `pveupdate serve`, a small token-protected API on the host:
 
 ```bash
-base=https://raw.githubusercontent.com/Niiikoc/Pveupdate/main
-curl -fsSL $base/systemd/pveupdate-serve.service -o /etc/systemd/system/pveupdate-serve.service
+base=https://github.com/Niiikoc/Pveupdate/releases/latest/download
+curl -fsSL $base/pveupdate-serve.service -o /etc/systemd/system/pveupdate-serve.service
 systemctl daemon-reload && systemctl enable --now pveupdate-serve
 pveupdate token      # enter this in the integration
 ```
@@ -77,8 +77,8 @@ The API (port 8765) accepts only: read status, list the node's guests, choose wh
 To also check for updates every 6 hours (read-only; updates still only happen when you press Install):
 
 ```bash
-curl -fsSL $base/systemd/pveupdate-check.service -o /etc/systemd/system/pveupdate-check.service
-curl -fsSL $base/systemd/pveupdate-check.timer -o /etc/systemd/system/pveupdate-check.timer
+curl -fsSL $base/pveupdate-check.service -o /etc/systemd/system/pveupdate-check.service
+curl -fsSL $base/pveupdate-check.timer -o /etc/systemd/system/pveupdate-check.timer
 systemctl daemon-reload && systemctl enable --now pveupdate-check.timer
 ```
 
@@ -104,3 +104,7 @@ Files on the host:
 | `/var/lib/pveupdate/status.json` | last check and update results |
 | `/var/log/pveupdate.log` | output of updates run without a terminal |
 | `/etc/pveupdate.token` | API token for `pveupdate serve` |
+
+## Contributing
+
+Issues and pull requests are welcome. Changes reach `main` only through a pull request that passes the checks and is merged by the maintainer, and users only get them once they're in a release.

@@ -1,0 +1,17 @@
+name: Check
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compiles with the oldest supported Python (Proxmox 8, Debian 12)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m py_compile pveupdate.py
+      - run: python pveupdate.py --version
