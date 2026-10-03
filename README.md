@@ -1,6 +1,6 @@
 # pveupdate
 
-Check and update selected Proxmox LXCs and VMs, only when you ask. Runs on the Proxmox host as root, Python 3 standard library only. It can be triggered from the host's shell or remotely from Home Assistant.
+Check and update selected Proxmox LXCs and VMs, only when you ask. Runs on the Proxmox host as root, Python 3 standard library only. Run it from the host's shell or from Home Assistant.
 
 ## Install
 
@@ -63,7 +63,7 @@ MariaDB, InfluxDB and other apt-installed apps are covered by the OS step.
 
 ## Home Assistant
 
-The recommended way is the **[Proxmox Guest Updates](https://github.com/Niiikoc/ha-pveupdate)** integration (installable through HACS). Each tracked guest shows up as a Home Assistant update entity with an Install button. It talks to `pveupdate serve`, a small token-protected API on the host:
+Use the **[Proxmox Guest Updates](https://github.com/Niiikoc/ha-pveupdate)** integration (installable through HACS). Each tracked guest shows up as a Home Assistant update entity with an Install button. It talks to `pveupdate serve`, a small token-protected API on the host:
 
 ```bash
 base=https://raw.githubusercontent.com/Niiikoc/Pveupdate/main
@@ -74,56 +74,15 @@ pveupdate token      # enter this in the integration
 
 The API (port 8765) accepts only: read status, start a check, update tracked guests, read the log. Every request needs the token. Keep the port on your LAN, and replace the token with `pveupdate token --new`.
 
-### Without the integration (SSH + YAML)
-
-This uses an SSH key that can **only** run pveupdate (`status`, `check`, `update`, `log`), nothing else.
-
-**1. On the Proxmox host**, install the remote wrapper and a timer that checks every 6 hours (checking is read-only; updates still only happen when you press the button):
+To also check for updates every 6 hours (read-only; updates still only happen when you press Install):
 
 ```bash
-base=https://raw.githubusercontent.com/Niiikoc/Pveupdate/main
-curl -fsSL $base/pveupdate-remote -o /usr/local/bin/pveupdate-remote && chmod +x /usr/local/bin/pveupdate-remote
 curl -fsSL $base/systemd/pveupdate-check.service -o /etc/systemd/system/pveupdate-check.service
 curl -fsSL $base/systemd/pveupdate-check.timer -o /etc/systemd/system/pveupdate-check.timer
 systemctl daemon-reload && systemctl enable --now pveupdate-check.timer
 ```
 
-**2. In Home Assistant** (Terminal & SSH add-on), create a key:
-
-```bash
-mkdir -p /config/.ssh && ssh-keygen -t ed25519 -N "" -f /config/.ssh/pveupdate -C homeassistant
-cat /config/.ssh/pveupdate.pub
-```
-
-**3. On the Proxmox host**, allow that key, restricted to the wrapper. Add this as one line to `/root/.ssh/authorized_keys`, with your key after `restrict`:
-
-```
-command="/usr/local/bin/pveupdate-remote",restrict ssh-ed25519 AAAA... homeassistant
-```
-
-**4. In Home Assistant**, copy [`homeassistant/pveupdate.yaml`](homeassistant/pveupdate.yaml) to `/config/packages/`, replace `192.168.1.10` with your host, enable packages in `configuration.yaml` if you haven't:
-
-```yaml
-homeassistant:
-  packages: !include_dir_named packages
-```
-
-Then restart Home Assistant. Test from the HA terminal first (this also saves the host key):
-
-```bash
-ssh -i /config/.ssh/pveupdate -o UserKnownHostsFile=/config/.ssh/known_hosts root@192.168.1.10 status
-```
-
-You get:
-
-- `sensor.proxmox_updates`: number of guests with pending updates; per-guest details (packages, app versions, last result, reboot needed) as attributes.
-- `script.pveupdate_check`, `script.pveupdate_update_pending`, and `script.pveupdate_update_guest` (takes IDs like `101 105`).
-- An automation that notifies you when updates are available.
-- A dashboard card: [`homeassistant/dashboard-card.yaml`](homeassistant/dashboard-card.yaml) (Add card > Manual).
-
-Updates started from Home Assistant run in the background without prompts. Their output goes to `/var/log/pveupdate.log` on the host (also readable with `ssh ... log`). If neither a snapshot nor a backup works, that guest is skipped instead of asking.
-
-**Why not GitHub Actions?** GitHub's runners are on the internet and can't reach your Proxmox host unless you expose SSH publicly or run a self-hosted runner on your network. Home Assistant is already inside your network, so it's the safer trigger.
+Updates started from Home Assistant run in the background without prompts. Their output goes to `/var/log/pveupdate.log` on the host. If neither a snapshot nor a backup works, that guest is skipped instead of asking.
 
 ## Other settings
 
