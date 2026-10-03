@@ -46,7 +46,7 @@ LOG_PATH = os.environ.get("PVEUPDATE_LOG", "/var/log/pveupdate.log")
 LOCK_PATH = os.environ.get("PVEUPDATE_LOCK", "/run/pveupdate.lock")
 TOKEN_PATH = os.environ.get("PVEUPDATE_TOKEN", "/etc/pveupdate.token")
 SNAP_PREFIX = "pveupd"
-VERSION = "0.6.0"
+VERSION = "0.6.1"
 EXEC_TIMEOUT = 3600
 
 DEFAULTS = {
@@ -1192,6 +1192,7 @@ def menu(cfg):
 def main():
     global QUIET
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--version", action="version", version=f"pveupdate {VERSION}")
     sub = p.add_subparsers(dest="command")
     pt = sub.add_parser("track", help="choose which guests to track (or give IDs to add)")
     pt.add_argument("ids", nargs="*")
