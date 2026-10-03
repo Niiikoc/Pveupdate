@@ -45,7 +45,7 @@ LOG_PATH = os.environ.get("PVEUPDATE_LOG", "/var/log/pveupdate.log")
 LOCK_PATH = os.environ.get("PVEUPDATE_LOCK", "/run/pveupdate.lock")
 TOKEN_PATH = os.environ.get("PVEUPDATE_TOKEN", "/etc/pveupdate.token")
 SNAP_PREFIX = "pveupd"
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 EXEC_TIMEOUT = 3600
 
 DEFAULTS = {
@@ -97,6 +97,14 @@ fi
 """
 
 REBOOT_CHECK = "test -f /var/run/reboot-required && echo yes || echo no"
+
+# Line 1: reboot needed (yes/no). Line 2: OS name and version, e.g. "Debian 12.11".
+GUEST_INFO = REBOOT_CHECK + r"""
+[ -r /etc/os-release ] && . /etc/os-release
+v=$VERSION_ID
+[ "$ID" = debian ] && [ -r /etc/debian_version ] && v=$(cat /etc/debian_version)
+echo "${NAME%% *} $v"
+"""
 
 # Prints the URL of the community-scripts ct script this container was made from.
 DETECT_APP = r"""
@@ -540,8 +548,11 @@ def check_guest(cfg, gid):
         return res
     pkgs = [p for p in out.split() if p]
     res.update(state="ok", packages=len(pkgs), package_names=pkgs)
-    _, out, _ = guest_exec(g["type"], gid, REBOOT_CHECK)
-    res["reboot_required"] = out.strip() == "yes"
+    _, out, _ = guest_exec(g["type"], gid, GUEST_INFO)
+    lines = out.strip().splitlines()
+    res["reboot_required"] = bool(lines) and lines[0] == "yes"
+    if len(lines) > 1 and lines[1].strip():
+        res["os"] = lines[1].strip()
     app = g.get("app")
     if app:
         # Containers tracked before script detection existed: detect once now.
@@ -736,6 +747,7 @@ def status_summary(cfg, st, full=False):
             "name": cfg["guests"][gid]["name"],
             "type": cfg["guests"][gid]["type"],
             "state": e.get("state", "unchecked"),
+            "os": e.get("os"),
             "packages": e.get("packages", 0),
             "app": app.get("label"),
             "app_installed": app.get("installed"),
