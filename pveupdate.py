@@ -46,7 +46,7 @@ LOG_PATH = os.environ.get("PVEUPDATE_LOG", "/var/log/pveupdate.log")
 LOCK_PATH = os.environ.get("PVEUPDATE_LOCK", "/run/pveupdate.lock")
 TOKEN_PATH = os.environ.get("PVEUPDATE_TOKEN", "/etc/pveupdate.token")
 SNAP_PREFIX = "pveupd"
-VERSION = "0.5.4"
+VERSION = "0.6.0"
 EXEC_TIMEOUT = 3600
 
 DEFAULTS = {
@@ -1071,6 +1071,11 @@ class ApiHandler(BaseHTTPRequestHandler):
         path = self.path.split("?", 1)[0]
         if path == "/api/status":
             self._send(200, status_summary(load_config(), load_status(), full=True))
+        elif path == "/api/guests":
+            cfg = load_config()
+            self._send(200, {"guests": [
+                {"id": gid, **g, "tracked": gid in cfg["guests"]} for gid, g in list_guests().items()
+            ]})
         elif path == "/api/log":
             try:
                 with open(LOG_PATH) as f:
@@ -1085,6 +1090,9 @@ class ApiHandler(BaseHTTPRequestHandler):
         if not self._authorized():
             return
         path = self.path.split("?", 1)[0]
+        if path == "/api/track":
+            self._track()
+            return
         if path not in ("/api/check", "/api/update"):
             self._send(404, {"error": "not found"})
             return
@@ -1095,6 +1103,39 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self._send(409, {"error": "a check or update is already running"})
                 return
             self._start(path)
+
+    def _track(self):
+        """Set the tracked guests to exactly the given list of IDs."""
+        body = self._body()
+        ids = (body or {}).get("guests")
+        if not isinstance(ids, list):
+            self._send(400, {"error": "guests must be a list of guest IDs"})
+            return
+        ids = [str(g) for g in ids]
+        with ApiHandler.start_lock:
+            # A running check or update keeps its own copy of the config and
+            # would overwrite this change when it saves.
+            if is_locked() or time.monotonic() - ApiHandler.last_start < 5:
+                self._send(409, {"error": "a check or update is running, try again when it finishes"})
+                return
+            cfg = load_config()
+            guests = list_guests()
+            unknown = [g for g in ids if g not in guests]
+            if unknown:
+                self._send(400, {"error": f"no such guest on this node: {', '.join(unknown)}"})
+                return
+            removed = [g for g in cfg["guests"] if g not in ids]
+            for gid in removed:
+                del cfg["guests"][gid]
+            add_guests(cfg, guests, [g for g in ids if g not in cfg["guests"]])
+            save_config(cfg)
+            if removed:
+                st = load_status()
+                for gid in removed:
+                    st["guests"].pop(gid, None)
+                save_json(STATUS_PATH, st)
+            log(f"tracked guests set from the API: {' '.join(sorted(cfg['guests'], key=int)) or 'none'}")
+        self._send(200, {"tracked": sorted(cfg["guests"], key=int)})
 
     def _start(self, path):
         if path == "/api/check":
