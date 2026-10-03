@@ -8,7 +8,8 @@ a snapshot first and can run an app-specific update step (community-scripts
 
 Usage:
   pveupdate.py                  interactive menu
-  pveupdate.py track            choose which guests to track
+  pveupdate.py track [ID ...]   choose which guests to track (or add these IDs)
+  pveupdate.py untrack ID ...   stop tracking guests
   pveupdate.py list             show tracked guests and their settings
   pveupdate.py check [ID ...]   show pending OS and app updates (changes nothing)
   pveupdate.py update [ID ...]  snapshot + update the given guests (asks if no IDs)
@@ -344,8 +345,15 @@ def app_text(info):
 
 def cmd_track(cfg, args):
     guests = list_guests()
+    removed = forget_missing(cfg, guests)
+    if args and args.ids:
+        add_guests(cfg, guests, args.ids)
+        save_config(cfg)
+        return
     if not guests:
         print("No guests found on this node.")
+        if removed:
+            save_config(cfg)
         return
     print("Guests on this node (* = tracked):\n")
     ids = list(guests)
@@ -355,21 +363,63 @@ def cmd_track(cfg, args):
         print(f"  {i:>2}. [{mark}] {gid:<5} {g['type']:<4} {g['name']:<25} {dim(g['status'])}")
     print("\nEnter numbers to toggle (e.g. `1 3 5`), `all`, or empty to keep as is.")
     sel = input("> ").strip()
-    if not sel:
+    if sel == "all":
+        add_guests(cfg, guests, [gid for gid in ids if gid not in cfg["guests"]])
+    elif sel:
+        try:
+            picks = [ids[int(x) - 1] for x in sel.replace(",", " ").split()]
+        except (ValueError, IndexError):
+            sys.exit(f"Invalid selection: {sel} (use the numbers from the list, 1-{len(ids)})")
+        for gid in picks:
+            if gid in cfg["guests"]:
+                del cfg["guests"][gid]
+                print(f"  untracked {gid} {guests[gid]['name']}")
+            else:
+                add_guests(cfg, guests, [gid])
+    elif not removed:
         return
-    picks = ids if sel == "all" else [ids[int(x) - 1] for x in sel.replace(",", " ").split()]
-    for gid in picks:
-        g = guests[gid]
-        if gid in cfg["guests"] and sel != "all":
-            del cfg["guests"][gid]
-            print(f"  untracked {gid} {g['name']}")
+    save_config(cfg)
+    print(f"\nSaved to {CONFIG_PATH}")
+
+
+def add_guests(cfg, guests, ids):
+    for gid in ids:
+        if gid not in guests:
+            print(f"  {gid}: no such guest on this node")
             continue
+        g = guests[gid]
         entry = cfg["guests"].setdefault(gid, {"type": g["type"], "name": g["name"]})
+        entry["name"] = g["name"]
         print(f"  tracking {gid} {g['name']}")
         if g["type"] == "lxc" and g["status"] == "running" and "app" not in entry:
             detect_app(entry, gid)
+
+
+def forget_missing(cfg, guests):
+    """Stop tracking guests that were deleted from Proxmox."""
+    missing = [gid for gid in cfg["guests"] if gid not in guests]
+    if not missing:
+        return []
+    st = load_status()
+    for gid in missing:
+        print(f"  {gid} {cfg['guests'][gid]['name']} no longer exists, untracked")
+        del cfg["guests"][gid]
+        st["guests"].pop(gid, None)
+    save_json(STATUS_PATH, st)
+    return missing
+
+
+def cmd_untrack(cfg, args):
+    for gid in args.ids:
+        if cfg["guests"].pop(gid, None) is None:
+            print(f"  {gid} was not tracked")
+        else:
+            print(f"  untracked {gid}")
+    st = load_status()
+    for gid in args.ids:
+        st["guests"].pop(gid, None)
+    save_json(STATUS_PATH, st)
     save_config(cfg)
-    print(f"\nSaved to {CONFIG_PATH}")
 
 
 def detect_app(entry, gid):
@@ -685,7 +735,10 @@ def main():
     global QUIET
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="command")
-    sub.add_parser("track", help="choose which guests to track")
+    pt = sub.add_parser("track", help="choose which guests to track (or give IDs to add)")
+    pt.add_argument("ids", nargs="*")
+    pun = sub.add_parser("untrack", help="stop tracking guests")
+    pun.add_argument("ids", nargs="+")
     sub.add_parser("list", help="show tracked guests")
     pc = sub.add_parser("check", help="show pending updates (read-only)")
     pc.add_argument("ids", nargs="*")
@@ -717,7 +770,7 @@ def main():
         sys.exit("Run as root on the Proxmox host.")
     QUIET = bool(getattr(args, "json", False) or getattr(args, "non_interactive", False))
     cfg = load_config()
-    handlers = {"track": cmd_track, "list": cmd_list, "check": cmd_check, "update": cmd_update,
+    handlers = {"track": cmd_track, "untrack": cmd_untrack, "list": cmd_list, "check": cmd_check, "update": cmd_update,
                 "status": cmd_status, "set": cmd_set}
     try:
         if args.command:

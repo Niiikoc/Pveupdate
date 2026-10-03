@@ -24,6 +24,16 @@ pveupdate update pending   # every guest the last check found updates for
 pveupdate status       # results of the last check and update, without re-checking
 ```
 
+Adding and removing guests:
+
+```bash
+pveupdate track        # list all guests (* = tracked), type numbers to toggle
+pveupdate track 108    # start tracking a new guest by ID
+pveupdate untrack 108  # stop tracking it
+```
+
+Guests you delete from Proxmox are untracked automatically the next time you run `track`.
+
 Each update does, per guest:
 
 1. Snapshot `pveupd-<date>` (keeps the last 3 by default; asks before continuing if the storage can't snapshot).
