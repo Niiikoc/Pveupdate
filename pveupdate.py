@@ -25,6 +25,7 @@ For Home Assistant / remote use see pveupdate-remote and the README.
 import argparse
 import datetime as dt
 import fcntl
+import hashlib
 import hmac
 import json
 import os
@@ -45,7 +46,7 @@ LOG_PATH = os.environ.get("PVEUPDATE_LOG", "/var/log/pveupdate.log")
 LOCK_PATH = os.environ.get("PVEUPDATE_LOCK", "/run/pveupdate.lock")
 TOKEN_PATH = os.environ.get("PVEUPDATE_TOKEN", "/etc/pveupdate.token")
 SNAP_PREFIX = "pveupd"
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 EXEC_TIMEOUT = 3600
 
 DEFAULTS = {
@@ -305,6 +306,16 @@ def take_snapshot(gtype, gid):
     if r.returncode != 0:
         return None, (r.stderr or r.stdout).strip()
     return name, None
+
+
+def disk_signature(gtype, gid):
+    """Fingerprint of a guest's disks and mount points. A guest that couldn't
+    be snapshotted is retried only when this changes (disk moved or added)."""
+    tool = "pct" if gtype == "lxc" else "qm"
+    r = run([tool, "config", gid, "--current"], check=False)
+    disks = sorted(line for line in r.stdout.splitlines()
+                   if re.match(r"(rootfs|mp\d+|scsi\d+|virtio\d+|sata\d+|ide\d+|efidisk\d+|tpmstate\d+):", line))
+    return hashlib.sha1("\n".join(disks).encode()).hexdigest()[:12]
 
 
 def backup_storage(cfg, gid):
@@ -627,7 +638,8 @@ def cmd_check(cfg, args):
         res = check_guest(cfg, gid)
         results[gid] = res
         prev = st["guests"].get(gid, {})
-        st["guests"][gid] = {**{k: v for k, v in prev.items() if k.startswith("last_")}, **res}
+        kept = {k: v for k, v in prev.items() if k.startswith("last_") or k == "nosnap_sig"}
+        st["guests"][gid] = {**kept, **res}
         if not QUIET:
             print_check_line(gid, res, args.verbose)
     st["checked_at"] = now()
@@ -670,11 +682,13 @@ def percent_counter(span, progress, step):
     return on_line
 
 
-def update_guest(cfg, gid, opts, progress=None):
+def update_guest(cfg, gid, opts, progress=None, entry=None):
     """Returns (result, detail). result: ok | reboot | failed | skipped.
 
-    progress(percent, step) is called as the update moves along.
+    progress(percent, step) is called as the update moves along. entry is the
+    guest's status entry; it remembers guests whose storage can't snapshot.
     """
+    entry = {} if entry is None else entry
     g = cfg["guests"][gid]
     gtype = g["type"]
     interactive = not opts.non_interactive
@@ -686,15 +700,22 @@ def update_guest(cfg, gid, opts, progress=None):
         return "skipped", "stopped"
 
     if setting(cfg, gid, "snapshot") and not opts.no_snapshot:
-        progress(PROGRESS_BACKUP[0], "snapshot")
-        snap, err = take_snapshot(gtype, gid)
+        sig = disk_signature(gtype, gid)
+        if entry.get("nosnap_sig") == sig:
+            # Known from an earlier attempt; trying again only adds a failed task in Proxmox.
+            snap, err = None, "not supported by this guest's storage"
+        else:
+            progress(PROGRESS_BACKUP[0], "snapshot")
+            snap, err = take_snapshot(gtype, gid)
+            if not snap and "snapshot feature is not available" in err:
+                entry["nosnap_sig"] = sig
         if snap:
             say(ok(f"  snapshot {snap}"))
             log(f"snapshot {snap}")
             prune_snapshots(gtype, gid, setting(cfg, gid, "keep_snapshots"))
         else:
-            say(warn(f"  snapshot failed: {err}"))
-            log(f"snapshot failed: {err}")
+            say(warn(f"  no snapshot: {err}"))
+            log(f"no snapshot: {err}")
             storage, berr = (None, "backup fallback is off")
             if setting(cfg, gid, "backup_fallback"):
                 progress(PROGRESS_BACKUP[0], "backup")
@@ -813,9 +834,9 @@ def _update_all(cfg, args, ids, st, results):
                 save_json(STATUS_PATH, st)
                 last[0] = time.monotonic()
 
-        result, detail = update_guest(cfg, gid, args, progress)
-        results[gid] = (result, detail)
         entry = st["guests"].setdefault(gid, {"name": cfg["guests"][gid]["name"], "type": cfg["guests"][gid]["type"]})
+        result, detail = update_guest(cfg, gid, args, progress, entry)
+        results[gid] = (result, detail)
         entry.update(last_update=now(), last_result=result, last_detail=detail,
                      reboot_required=(result == "reboot"))
         if result in ("ok", "reboot"):
