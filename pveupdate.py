@@ -19,7 +19,7 @@ Usage:
   pveupdate.py token            print the API token
   pveupdate.py set ID [options] change a guest's settings (see `set --help`)
 
-For Home Assistant / remote use see pveupdate-remote and the README.
+For Home Assistant see `pveupdate serve` and the README.
 """
 
 import argparse
@@ -46,7 +46,7 @@ LOG_PATH = os.environ.get("PVEUPDATE_LOG", "/var/log/pveupdate.log")
 LOCK_PATH = os.environ.get("PVEUPDATE_LOCK", "/run/pveupdate.lock")
 TOKEN_PATH = os.environ.get("PVEUPDATE_TOKEN", "/etc/pveupdate.token")
 SNAP_PREFIX = "pveupd"
-VERSION = "0.5.3"
+VERSION = "0.5.4"
 EXEC_TIMEOUT = 3600
 
 DEFAULTS = {
@@ -1165,7 +1165,7 @@ def main():
     pu.add_argument("ids", nargs="*", help="guest IDs, `all`, or `pending` (from the last check)")
     pu.add_argument("-y", "--yes", action="store_true", help="don't ask for confirmation")
     pu.add_argument("--non-interactive", action="store_true",
-                    help="no prompts, output to the log; for remote/Home Assistant use")
+                    help="no prompts, output to the log; for Home Assistant use")
     pu.add_argument("--no-snapshot", action="store_true")
     pu.add_argument("--no-app", action="store_true", help="only OS packages")
     pu.add_argument("--json", action="store_true", help="print status JSON instead of text")
