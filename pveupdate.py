@@ -45,7 +45,7 @@ LOG_PATH = os.environ.get("PVEUPDATE_LOG", "/var/log/pveupdate.log")
 LOCK_PATH = os.environ.get("PVEUPDATE_LOCK", "/run/pveupdate.lock")
 TOKEN_PATH = os.environ.get("PVEUPDATE_TOKEN", "/etc/pveupdate.token")
 SNAP_PREFIX = "pveupd"
-VERSION = "0.5.0"
+VERSION = "0.5.2"
 EXEC_TIMEOUT = 3600
 
 DEFAULTS = {
@@ -711,9 +711,17 @@ def update_guest(cfg, gid, opts, progress=None):
 
     def step(script, env=None, on_line=None):
         live = interactive and gtype == "lxc"
+        stream = not live and gtype == "lxc"
+
+        def log_line(line):
+            # Written as it arrives, so `tail -f` on the log follows a running update.
+            log(line)
+            if on_line:
+                on_line(line)
+
         code, out, err = guest_exec(gtype, gid, script, env=env, interactive=live,
-                                    on_line=None if live or gtype != "lxc" else on_line)
-        if not live:
+                                    on_line=log_line if stream else None)
+        if not live and not stream:
             log(out + err)
             if interactive:
                 say(out[-3000:] + err[-1000:])
