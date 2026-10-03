@@ -1,0 +1,7 @@
+[Unit]
+Description=pveupdate: check tracked guests for updates (read-only)
+After=pve-guests.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/pveupdate check --json
