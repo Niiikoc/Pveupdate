@@ -37,7 +37,7 @@ Guests you delete from Proxmox are untracked automatically the next time you run
 
 Each update does, per guest:
 
-1. Snapshot `pveupd-<date>` (keeps the last 3 by default; asks before continuing if the storage can't snapshot).
+1. Snapshot `pveupd-<date>` (keeps the last 3 by default). If the guest can't be snapshotted (directory storage, bind mounts), a `vzdump` backup is taken instead, to your backup storage (Proxmox Backup Server if you have one, otherwise the first active backup storage). Only the newest pveupdate backup per guest is kept; your other backups are never touched. If neither works, the guest is skipped.
 2. OS packages: `apt-get update && apt-get dist-upgrade` (keeps your config files), then `autoremove`. Alpine uses `apk upgrade`.
 3. App step, if configured. Output goes to your terminal so you can answer prompts.
 4. Reports whether a reboot is needed.
@@ -121,14 +121,17 @@ You get:
 - An automation that notifies you when updates are available.
 - A dashboard card: [`homeassistant/dashboard-card.yaml`](homeassistant/dashboard-card.yaml) (Add card > Manual).
 
-Updates started from Home Assistant run in the background without prompts. Their output goes to `/var/log/pveupdate.log` on the host (also readable with `ssh ... log`). If a snapshot fails, that guest is skipped instead of asking.
+Updates started from Home Assistant run in the background without prompts. Their output goes to `/var/log/pveupdate.log` on the host (also readable with `ssh ... log`). If neither a snapshot nor a backup works, that guest is skipped instead of asking.
 
 **Why not GitHub Actions?** GitHub's runners are on the internet and can't reach your Proxmox host unless you expose SSH publicly or run a self-hosted runner on your network. Home Assistant is already inside your network, so it's the safer trigger.
 
 ## Other settings
 
 ```bash
-pveupdate set 102 --snapshot off     # e.g. storage without snapshot support
+pveupdate set 102 --snapshot off     # skip snapshot and backup for this guest
+pveupdate set default --backup-storage pbs   # where fallback backups go (default: auto)
+pveupdate set 140 --keep-backups 2   # keep more pveupdate backups for one guest
+pveupdate set 140 --backup-fallback off
 pveupdate set 102 --keep 5
 pveupdate set 102 --os-cmd '...'     # replace the OS step; '' resets it
 pveupdate set 104 --app-cmd ''       # remove the app step
