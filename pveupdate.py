@@ -58,6 +58,9 @@ DEFAULTS = {
     "backup_fallback": True,
     "backup_storage": None,
     "keep_backups": 1,
+    # RAM (MB) an LXC gets while its app update runs; apps that compile
+    # (Zigbee2MQTT, Obico...) can crawl for hours in 1 GB. 0 = never change.
+    "build_memory": 2048,
 }
 BACKUP_NOTE = "pveupdate: before update"
 
@@ -682,6 +685,52 @@ def percent_counter(span, progress, step):
     return on_line
 
 
+def _build_memory_marker(gid):
+    return os.path.join(os.path.dirname(STATUS_PATH), f"build-memory-{gid}")
+
+
+def raise_memory(cfg, gtype, gid):
+    """Give an LXC more RAM for its app update, if the host can spare it.
+    Returns the original memory (MB) to restore, or None if unchanged."""
+    target = setting(cfg, gid, "build_memory") or 0
+    if gtype != "lxc" or target <= 0:
+        return None
+    m = re.search(r"^memory:\s*(\d+)", run(["pct", "config", gid], check=False).stdout, re.M)
+    current = int(m.group(1)) if m else 512
+    if current >= target:
+        return None
+    try:
+        with open("/proc/meminfo") as f:
+            avail = int(re.search(r"MemAvailable:\s*(\d+)", f.read()).group(1)) // 1024
+    except (OSError, AttributeError):
+        avail = 0
+    if avail < target - current + 1024:
+        say(dim(f"  host has {avail} MB free, keeping {current} MB for the app update"))
+        return None
+    if run(["pct", "set", gid, "--memory", str(target)], check=False).returncode != 0:
+        return None
+    # Remembered on disk too, so an interrupted update is still undone next time.
+    with open(_build_memory_marker(gid), "w") as f:
+        f.write(str(current))
+    say(f"  memory raised to {target} MB for the app update (was {current} MB)")
+    log(f"memory {current} -> {target} MB for app update")
+    return current
+
+
+def restore_memory(gid):
+    """Put back the RAM raise_memory changed, including after an interrupted run."""
+    marker = _build_memory_marker(gid)
+    try:
+        with open(marker) as f:
+            original = int(f.read().strip())
+    except (OSError, ValueError):
+        return
+    if run(["pct", "set", gid, "--memory", str(original)], check=False).returncode == 0:
+        os.remove(marker)
+        say(f"  memory back to {original} MB")
+        log(f"memory restored to {original} MB")
+
+
 def update_guest(cfg, gid, opts, progress=None, entry=None):
     """Returns (result, detail). result: ok | reboot | failed | skipped.
 
@@ -698,6 +747,7 @@ def update_guest(cfg, gid, opts, progress=None, entry=None):
     if not is_running(gtype, gid):
         say(dim("  stopped, skipped"))
         return "skipped", "stopped"
+    restore_memory(gid)  # left over from an interrupted update
 
     if setting(cfg, gid, "snapshot") and not opts.no_snapshot:
         sig = disk_signature(gtype, gid)
@@ -754,8 +804,12 @@ def update_guest(cfg, gid, opts, progress=None, entry=None):
     if app and not opts.no_app:
         say(f"  running app update: {app['cmd']}")
         progress(PROGRESS_APP[0], "app")
-        # PHS_SILENT=1 makes community-scripts `update` skip its menu.
-        code = step(app["cmd"], None if interactive else {"PHS_SILENT": 1})
+        raise_memory(cfg, gtype, gid)
+        try:
+            # PHS_SILENT=1 makes community-scripts `update` skip its menu.
+            code = step(app["cmd"], None if interactive else {"PHS_SILENT": 1})
+        finally:
+            restore_memory(gid)
         if code != 0:
             say(bad(f"  app update failed (exit {code})"))
             return "failed", f"app update failed (exit {code})"
@@ -918,6 +972,8 @@ def cmd_set(cfg, args):
         g["backup_storage"] = args.backup_storage or None
     if args.keep_backups is not None:
         g["keep_backups"] = args.keep_backups
+    if args.build_memory is not None:
+        g["build_memory"] = args.build_memory
     if args.snapshot is not None:
         g["snapshot"] = args.snapshot == "on"
     if args.keep is not None:
@@ -1118,6 +1174,8 @@ def main():
                     help="take a vzdump backup when a snapshot isn't possible (default on)")
     ps.add_argument("--backup-storage", help="storage for fallback backups ('' = auto)")
     ps.add_argument("--keep-backups", type=int, help="how many pveupdate backups to keep (default 1)")
+    ps.add_argument("--build-memory", type=int, metavar="MB",
+                    help="RAM an LXC gets during its app update (default 2048, 0 = don't change)")
     ps.add_argument("--keep", type=int, help="how many pveupdate snapshots to keep")
     ps.add_argument("--os-cmd", help="replace the OS update command ('' to reset)")
     ps.add_argument("--app-cmd", help="app update command run after OS packages ('' to remove)")
