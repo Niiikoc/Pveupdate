@@ -63,7 +63,7 @@ MariaDB, InfluxDB and other apt-installed apps are covered by the OS step.
 
 ## Home Assistant
 
-Use the **[Proxmox Guest Updates](https://github.com/Niiikoc/ha-pveupdate)** integration (installable through HACS). Each tracked guest shows up as a Home Assistant update entity with an Install button. It talks to `pveupdate serve`, a small token-protected API on the host:
+Use the **[Proxmox Guest Updates](https://github.com/Niiikoc/ha-pveupdate)** integration (installable through HACS). Each tracked guest shows up as a Home Assistant update entity with an Install button, and you can choose the tracked guests under the integration's Configure. It talks to `pveupdate serve`, a small token-protected API on the host:
 
 ```bash
 base=https://raw.githubusercontent.com/Niiikoc/Pveupdate/main
@@ -72,7 +72,7 @@ systemctl daemon-reload && systemctl enable --now pveupdate-serve
 pveupdate token      # enter this in the integration
 ```
 
-The API (port 8765) accepts only: read status, start a check, update tracked guests, read the log. Every request needs the token. Keep the port on your LAN, and replace the token with `pveupdate token --new`.
+The API (port 8765) accepts only: read status, list the node's guests, choose which guests are tracked, start a check, update tracked guests, read the log. Every request needs the token. Keep the port on your LAN, and replace the token with `pveupdate token --new`.
 
 To also check for updates every 6 hours (read-only; updates still only happen when you press Install):
 
