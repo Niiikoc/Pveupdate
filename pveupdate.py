@@ -48,7 +48,17 @@ SNAP_PREFIX = "pveupd"
 VERSION = "0.3.0"
 EXEC_TIMEOUT = 3600
 
-DEFAULTS = {"snapshot": True, "keep_snapshots": 3, "autoremove": True}
+DEFAULTS = {
+    "snapshot": True,
+    "keep_snapshots": 3,
+    "autoremove": True,
+    # When a snapshot isn't possible (directory storage, bind mounts), take a
+    # vzdump backup instead. Storage None = first active backup storage.
+    "backup_fallback": True,
+    "backup_storage": None,
+    "keep_backups": 1,
+}
+BACKUP_NOTE = "pveupdate: before update"
 
 # Apps not installed by community-scripts: how to read the installed version
 # and where releases live. Community-scripts apps are detected automatically.
@@ -258,6 +268,48 @@ def take_snapshot(gtype, gid):
     if r.returncode != 0:
         return None, (r.stderr or r.stdout).strip()
     return name, None
+
+
+def backup_storage(cfg, gid):
+    """Configured backup storage, or the first active storage that holds backups."""
+    st = setting(cfg, gid, "backup_storage")
+    if st:
+        return st
+    r = run(["pvesm", "status", "--content", "backup"], check=False)
+    rows = [line.split() for line in r.stdout.splitlines()[1:] if line.strip()]
+    active = [row for row in rows if len(row) > 2 and row[2] == "active"]
+    # Prefer Proxmox Backup Server if there is one.
+    active.sort(key=lambda row: row[1] != "pbs")
+    return active[0][0] if active else None
+
+
+def take_backup(cfg, gtype, gid):
+    """vzdump fallback for guests that can't be snapshotted. Returns (storage, error)."""
+    storage = backup_storage(cfg, gid)
+    if not storage:
+        return None, "no storage with backup content found (set one with `pveupdate set default --backup-storage NAME`)"
+    say(f"  snapshot not possible, taking a backup to {storage} instead (this can take a while)...")
+    r = run(["vzdump", gid, "--storage", storage, "--mode", "snapshot", "--compress", "zstd",
+             "--notes-template", BACKUP_NOTE, "--prune-backups", "keep-all=1"], check=False)
+    log(r.stdout + r.stderr)
+    if r.returncode != 0:
+        lines = (r.stderr or r.stdout).strip().splitlines()
+        return None, lines[-1] if lines else f"vzdump exit {r.returncode}"
+    return storage, None
+
+
+def prune_backups(storage, gid, keep):
+    """Remove older pveupdate backups of this guest; never touches other backups."""
+    node = socket.gethostname()
+    r = run(["pvesh", "get", f"/nodes/{node}/storage/{storage}/content", "--content", "backup",
+             "--vmid", gid, "--output-format", "json"], check=False)
+    if r.returncode != 0:
+        return
+    ours = sorted((b for b in json.loads(r.stdout) if (b.get("notes") or "").startswith(BACKUP_NOTE)),
+                  key=lambda b: b.get("ctime", 0))
+    for b in ours[:-keep] if keep > 0 else ours:
+        run(["pvesm", "free", b["volid"]], check=False)
+        say(dim(f"    removed old backup {b['volid']}"))
 
 
 def prune_snapshots(gtype, gid, keep):
@@ -562,10 +614,20 @@ def update_guest(cfg, gid, opts):
             log(f"snapshot {snap}")
             prune_snapshots(gtype, gid, setting(cfg, gid, "keep_snapshots"))
         else:
-            say(bad(f"  snapshot failed: {err}"))
+            say(warn(f"  snapshot failed: {err}"))
             log(f"snapshot failed: {err}")
-            if not interactive or not ask("  Continue without a snapshot?", default=False):
-                return "skipped", f"snapshot failed: {err}"
+            storage, berr = (None, "backup fallback is off")
+            if setting(cfg, gid, "backup_fallback"):
+                storage, berr = take_backup(cfg, gtype, gid)
+            if storage:
+                say(ok(f"  backup saved to {storage}"))
+                log(f"backup saved to {storage}")
+                prune_backups(storage, gid, setting(cfg, gid, "keep_backups"))
+            else:
+                say(bad(f"  backup failed: {berr}"))
+                log(f"backup failed: {berr}")
+                if not interactive or not ask("  Continue without a snapshot or backup?", default=False):
+                    return "skipped", f"no snapshot ({err}) or backup ({berr})"
 
     def step(script, env=None):
         live = interactive and gtype == "lxc"
@@ -683,6 +745,7 @@ def status_summary(cfg, st, full=False):
             "checked_at": e.get("checked_at"),
             "last_update": e.get("last_update"),
             "last_result": e.get("last_result"),
+            "last_detail": e.get("last_detail"),
             "reboot_required": bool(e.get("reboot_required")),
         }
         if e.get("error"):
@@ -718,9 +781,18 @@ def cmd_status(cfg, args):
 
 
 def cmd_set(cfg, args):
-    if args.id not in cfg["guests"]:
+    if args.id == "default":
+        g = cfg["defaults"]  # applies to every guest without its own setting
+    elif args.id in cfg["guests"]:
+        g = cfg["guests"][args.id]
+    else:
         sys.exit(f"{args.id} is not tracked (run `track` first)")
-    g = cfg["guests"][args.id]
+    if args.backup_fallback is not None:
+        g["backup_fallback"] = args.backup_fallback == "on"
+    if args.backup_storage is not None:
+        g["backup_storage"] = args.backup_storage or None
+    if args.keep_backups is not None:
+        g["keep_backups"] = args.keep_backups
     if args.snapshot is not None:
         g["snapshot"] = args.snapshot == "on"
     if args.keep is not None:
@@ -735,7 +807,7 @@ def cmd_set(cfg, args):
             g.setdefault("app", {})["cmd"] = args.app_cmd
         else:
             g.pop("app", None)
-    if "app" in g:
+    if "app" in g and args.id != "default":
         for key in ("version_cmd", "github", "preset"):
             val = getattr(args, key)
             if val is not None:
@@ -915,8 +987,12 @@ def main():
     pst.add_argument("--json", action="store_true")
     pst.add_argument("-v", "--verbose", action="store_true", help="include package names")
     ps = sub.add_parser("set", help="change a tracked guest's settings")
-    ps.add_argument("id")
+    ps.add_argument("id", help="guest ID, or `default` for all guests")
     ps.add_argument("--snapshot", choices=["on", "off"])
+    ps.add_argument("--backup-fallback", choices=["on", "off"],
+                    help="take a vzdump backup when a snapshot isn't possible (default on)")
+    ps.add_argument("--backup-storage", help="storage for fallback backups ('' = auto)")
+    ps.add_argument("--keep-backups", type=int, help="how many pveupdate backups to keep (default 1)")
     ps.add_argument("--keep", type=int, help="how many pveupdate snapshots to keep")
     ps.add_argument("--os-cmd", help="replace the OS update command ('' to reset)")
     ps.add_argument("--app-cmd", help="app update command run after OS packages ('' to remove)")
