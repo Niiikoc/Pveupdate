@@ -46,7 +46,7 @@ LOG_PATH = os.environ.get("PVEUPDATE_LOG", "/var/log/pveupdate.log")
 LOCK_PATH = os.environ.get("PVEUPDATE_LOCK", "/run/pveupdate.lock")
 TOKEN_PATH = os.environ.get("PVEUPDATE_TOKEN", "/etc/pveupdate.token")
 SNAP_PREFIX = "pveupd"
-VERSION = "0.7.0"
+VERSION = "0.7.1"
 EXEC_TIMEOUT = 3600
 
 DEFAULTS = {
@@ -421,21 +421,32 @@ def community_app_source(script_url):
     return name.lower(), None
 
 
-def app_version(gtype, gid, app):
-    """Returns {label, installed, latest, update_available} or None if unknown."""
+# `pihole -v`: "Core version is v6.1.4 (Latest: v6.2.1)" (v5: "Pi-hole version is ...").
+PIHOLE_VERSION = re.compile(r"version is v?(\S+)\s+\(Latest: v?([^)\s]+)\)")
+
+
+def app_version(gtype, gid, app, name=None):
+    """Returns {label, installed, latest, update_available}; versions are None when unknown."""
     preset = APP_PRESETS.get(app.get("preset", ""), {})
     version_cmd = app.get("version_cmd") or preset.get("version_cmd")
     repo = app.get("github") or preset.get("github")
-    label = app.get("preset") or app.get("script_name") or (repo or "").split("/")[-1] or "app"
-    if not version_cmd and app.get("script"):
-        vfile, gh = community_app_source(app["script"])
-        version_cmd = f"cat /root/.{vfile} 2>/dev/null"
-        repo = repo or gh
-    if not version_cmd:
-        return None
-    code, out, _ = guest_exec(gtype, gid, version_cmd)
-    installed = out.strip().lstrip("v") if code == 0 else ""
-    latest = latest_github_release(repo) if repo else None
+    label = app.get("preset") or app.get("script_name") or (repo or "").split("/")[-1] or name or "app"
+    installed = latest = None
+    if not version_cmd and app.get("script_name") == "pihole":
+        # Pi-hole reports its own installed and latest version.
+        code, out, _ = guest_exec(gtype, gid, "pihole -v 2>/dev/null | head -n 1")
+        m = PIHOLE_VERSION.search(out) if code == 0 else None
+        if m:
+            installed, latest = m.group(1), (None if m.group(2) == "N/A" else m.group(2))
+    else:
+        if not version_cmd and app.get("script"):
+            vfile, gh = community_app_source(app["script"])
+            version_cmd = f"cat /root/.{vfile} 2>/dev/null"
+            repo = repo or gh
+        if version_cmd:
+            code, out, _ = guest_exec(gtype, gid, version_cmd)
+            installed = (out.strip().lstrip("v") if code == 0 else "") or None
+            latest = latest_github_release(repo) if repo else None
     return {
         "label": label,
         "installed": installed or None,
@@ -616,7 +627,7 @@ def check_guest(cfg, gid):
         if g["type"] == "lxc" and app.get("cmd") == "update" and "script" not in app:
             if detect_app(g, gid):
                 save_config(cfg)
-        res["app"] = app_version(g["type"], gid, app)
+        res["app"] = app_version(g["type"], gid, app, g["name"])
     return res
 
 
