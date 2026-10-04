@@ -21,6 +21,8 @@ pveupdate check -v     # pending OS packages + app versions, changes nothing
 pveupdate update       # check, then asks which guests to update
 pveupdate update 101 105
 pveupdate update pending   # every guest the last check found updates for
+pveupdate update --no-os 105    # only the app update
+pveupdate update --no-app 105   # only the OS packages
 pveupdate status       # results of the last check and update, without re-checking
 pveupdate serve        # HTTP API for the Home Assistant integration (see below)
 ```
@@ -63,7 +65,7 @@ MariaDB, InfluxDB and other apt-installed apps are covered by the OS step.
 
 ## Home Assistant
 
-Use the **[Proxmox Guest Updates](https://github.com/Niiikoc/ha-pveupdate)** integration (installable through HACS). Each tracked guest shows up as a Home Assistant update entity with an Install button, and you can choose the tracked guests under the integration's Configure. It talks to `pveupdate serve`, a small token-protected API on the host:
+Use the **[Proxmox Guest Updates](https://github.com/Niiikoc/ha-pveupdate)** integration (installable through HACS). Guests with an app show up under Settings > Updates when a new app version is out, and Install runs only the app update. OS packages get an "Update OS" button and a pending-packages sensor on each guest's device page, so they never nag you in Updates. You can choose the tracked guests under the integration's Configure. It talks to `pveupdate serve`, a small token-protected API on the host:
 
 ```bash
 base=https://github.com/Niiikoc/Pveupdate/releases/latest/download

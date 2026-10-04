@@ -46,7 +46,7 @@ LOG_PATH = os.environ.get("PVEUPDATE_LOG", "/var/log/pveupdate.log")
 LOCK_PATH = os.environ.get("PVEUPDATE_LOCK", "/run/pveupdate.lock")
 TOKEN_PATH = os.environ.get("PVEUPDATE_TOKEN", "/etc/pveupdate.token")
 SNAP_PREFIX = "pveupd"
-VERSION = "0.6.1"
+VERSION = "0.7.0"
 EXEC_TIMEOUT = 3600
 
 DEFAULTS = {
@@ -77,7 +77,8 @@ OS_CHECK = r"""
 if command -v apt-get >/dev/null; then
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq >/dev/null 2>&1 || { echo "ERR apt-get update failed"; exit 1; }
-  apt list --upgradable 2>/dev/null | grep -v '^Listing' | cut -d/ -f1
+  # "name suite" per line; the suite tells security updates apart.
+  apt list --upgradable 2>/dev/null | grep -v '^Listing' | awk -F'[/ ]' '{print $1, $2}'
 elif command -v apk >/dev/null; then
   apk update -q >/dev/null 2>&1
   apk version -l '<' 2>/dev/null | tail -n +2 | awk '{print $1}'
@@ -564,21 +565,22 @@ def cmd_list(cfg, args):
         print(f"  {gid:<5} {g['type']:<4} {g['name']:<25} {snap:<12} {app_txt}")
 
 
-def pick_ids(cfg, ids, status=None):
+def pick_ids(cfg, ids, status=None, os_part=True, app_part=True):
     tracked = sorted(cfg["guests"], key=int)
     if not ids or ids == ["all"]:
         return tracked
     if ids == ["pending"]:
         st = (status or load_status())["guests"]
-        return [g for g in tracked if g in st and is_pending(st[g])]
+        return [g for g in tracked if g in st and is_pending(st[g], os_part, app_part)]
     unknown = [i for i in ids if i not in cfg["guests"]]
     if unknown:
         sys.exit(f"Not tracked: {', '.join(unknown)} (run `track` first)")
     return ids
 
 
-def is_pending(entry):
-    return bool(entry.get("packages")) or bool((entry.get("app") or {}).get("update_available"))
+def is_pending(entry, os_part=True, app_part=True):
+    return ((os_part and bool(entry.get("packages")))
+            or (app_part and bool((entry.get("app") or {}).get("update_available"))))
 
 
 def check_guest(cfg, gid):
@@ -592,8 +594,15 @@ def check_guest(cfg, gid):
     if code != 0:
         res.update(state="error", error=(out + err).strip()[:300], packages=0, package_names=[])
         return res
-    pkgs = [p for p in out.split() if p]
-    res.update(state="ok", packages=len(pkgs), package_names=pkgs)
+    pkgs, security = [], []
+    for line in out.splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        pkgs.append(parts[0])
+        if len(parts) > 1 and "security" in parts[1]:
+            security.append(parts[0])
+    res.update(state="ok", packages=len(pkgs), package_names=pkgs, security_packages=len(security))
     _, out, _ = guest_exec(g["type"], gid, GUEST_INFO)
     lines = out.strip().splitlines()
     res["reboot_required"] = bool(lines) and lines[0] == "yes"
@@ -749,6 +758,9 @@ def update_guest(cfg, gid, opts, progress=None, entry=None):
     if not is_running(gtype, gid):
         say(dim("  stopped, skipped"))
         return "skipped", "stopped"
+    if getattr(opts, "no_os", False) and not g.get("app"):
+        say(dim("  no app to update, skipped"))
+        return "skipped", "no app"
     restore_memory(gid)  # left over from an interrupted update
 
     if setting(cfg, gid, "snapshot") and not opts.no_snapshot:
@@ -800,15 +812,16 @@ def update_guest(cfg, gid, opts, progress=None, entry=None):
                 say(out[-3000:] + err[-1000:])
         return code
 
-    say("  updating OS packages...")
-    progress(PROGRESS_OS[0], "os")
-    npkg = (load_status()["guests"].get(gid) or {}).get("packages") or 1
-    code = step(g.get("os_cmd") or OS_UPGRADE, {"AUTOREMOVE": 1 if setting(cfg, gid, "autoremove") else 0},
-                apt_counter(npkg, PROGRESS_OS, progress, "os"))
-    if code != 0:
-        say(bad(f"  OS update failed (exit {code})"))
-        return "failed", f"OS update failed (exit {code})"
-    say(ok("  OS packages updated"))
+    if not getattr(opts, "no_os", False):
+        say("  updating OS packages...")
+        progress(PROGRESS_OS[0], "os")
+        npkg = (load_status()["guests"].get(gid) or {}).get("packages") or 1
+        code = step(g.get("os_cmd") or OS_UPGRADE, {"AUTOREMOVE": 1 if setting(cfg, gid, "autoremove") else 0},
+                    apt_counter(npkg, PROGRESS_OS, progress, "os"))
+        if code != 0:
+            say(bad(f"  OS update failed (exit {code})"))
+            return "failed", f"OS update failed (exit {code})"
+        say(ok("  OS packages updated"))
 
     app = g.get("app")
     if app and not opts.no_app:
@@ -835,10 +848,13 @@ def update_guest(cfg, gid, opts, progress=None, entry=None):
 
 def cmd_update(cfg, args):
     ids = args.ids
+    os_part, app_part = not getattr(args, "no_os", False), not args.no_app
+    if not (os_part or app_part):
+        sys.exit("--no-os and --no-app together leave nothing to update.")
     if not ids and not args.non_interactive:
         pending = cmd_check(cfg, argparse.Namespace(ids=[], verbose=False, json=False))
         candidates = [gid for gid in sorted(cfg["guests"], key=int)
-                      if gid in pending and is_pending(pending[gid])]
+                      if gid in pending and is_pending(pending[gid], os_part, app_part)]
         if not candidates:
             say("\nNothing to update.")
             return
@@ -849,7 +865,7 @@ def cmd_update(cfg, args):
         ids = candidates if sel == "all" else sel.replace(",", " ").split()
     elif not ids:
         sys.exit("Give guest IDs, `all` or `pending` when running non-interactively.")
-    ids = pick_ids(cfg, ids)
+    ids = pick_ids(cfg, ids, os_part=os_part, app_part=app_part)
     if not ids:
         say("Nothing to update.")
         return
@@ -866,6 +882,7 @@ def cmd_update(cfg, args):
     finally:
         st.pop("activity", None)
         st.pop("updating", None)
+        st.pop("updating_part", None)
         st.pop("queue", None)
         st.pop("progress", None)
         st.pop("step", None)
@@ -886,7 +903,9 @@ def cmd_update(cfg, args):
 def _update_all(cfg, args, ids, st, results):
     for i, gid in enumerate(ids):
         # Progress for Home Assistant: which guest is updating, which are queued.
-        st.update(activity="updating", updating=gid, queue=ids[i + 1:], progress=0, step="starting")
+        part = "app" if getattr(args, "no_os", False) else "os" if getattr(args, "no_app", False) else "all"
+        st.update(activity="updating", updating=gid, updating_part=part, queue=ids[i + 1:], progress=0,
+                  step="starting")
         save_json(STATUS_PATH, st)
         last = [0.0]
 
@@ -922,6 +941,7 @@ def status_summary(cfg, st, full=False):
             "os": e.get("os"),
             "os_latest": e.get("os_latest"),
             "packages": e.get("packages", 0),
+            "security_packages": e.get("security_packages", 0),
             "app": app.get("label"),
             "app_installed": app.get("installed"),
             "app_latest": app.get("latest"),
@@ -944,6 +964,8 @@ def status_summary(cfg, st, full=False):
         "running": running,
         "activity": st.get("activity") if running else None,
         "updating": st.get("updating") if running else None,
+        # What the running update covers: all, os or app.
+        "updating_part": st.get("updating_part") if running and st.get("updating") else None,
         "queue": st.get("queue", []) if running else [],
         # Progress of the guest being updated: percent and step
         # (snapshot, backup, os, app, finishing).
@@ -1153,9 +1175,14 @@ class ApiHandler(BaseHTTPRequestHandler):
         else:
             self._send(400, {"error": "guests must be 'all', 'pending' or a list of tracked guest IDs"})
             return
-        spawn("update", "--non-interactive", *ids)
+        part = (body or {}).get("part", "all")
+        flags = {"all": [], "os": ["--no-app"], "app": ["--no-os"]}.get(part)
+        if flags is None:
+            self._send(400, {"error": "part must be 'all', 'os' or 'app'"})
+            return
+        spawn("update", "--non-interactive", *flags, *ids)
         ApiHandler.last_start = time.monotonic()
-        self._send(202, {"started": "update", "guests": ids})
+        self._send(202, {"started": "update", "guests": ids, "part": part})
 
 
 def cmd_serve(cfg, args):
@@ -1179,7 +1206,7 @@ def menu(cfg):
         if choice == "1":
             cmd_check(cfg, argparse.Namespace(ids=[], verbose=True, json=False))
         elif choice == "2":
-            cmd_update(cfg, argparse.Namespace(ids=[], yes=False, no_snapshot=False, no_app=False,
+            cmd_update(cfg, argparse.Namespace(ids=[], yes=False, no_snapshot=False, no_app=False, no_os=False,
                                                non_interactive=False, json=False))
         elif choice == "3":
             cmd_track(cfg, None)
@@ -1210,6 +1237,7 @@ def main():
                     help="no prompts, output to the log; for Home Assistant use")
     pu.add_argument("--no-snapshot", action="store_true")
     pu.add_argument("--no-app", action="store_true", help="only OS packages")
+    pu.add_argument("--no-os", action="store_true", help="only the app update")
     pu.add_argument("--json", action="store_true", help="print status JSON instead of text")
     psv = sub.add_parser("serve", help="run the HTTP API for the Home Assistant integration")
     psv.add_argument("--bind", default="0.0.0.0")
