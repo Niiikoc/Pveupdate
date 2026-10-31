@@ -1039,12 +1039,17 @@ def update_guest(cfg, gid, opts, progress=None, entry=None):
 
     app = g.get("app")
     if app and not opts.no_app:
-        say(f"  running app update: {app['cmd']}")
+        # A version that comes from apt is upgraded by apt: a community-scripts
+        # `update` may finish without touching the package.
+        cmd = app["cmd"]
+        if cmd == "update" and app.get("package"):
+            cmd = APT_APP_UPGRADE % shlex.quote(app["package"])
+        say(f"  running app update: {cmd}")
         progress(PROGRESS_APP[0], "app")
         raise_memory(cfg, gtype, gid)
         try:
             # PHS_SILENT=1 makes community-scripts `update` skip its menu.
-            code = step(app["cmd"], None if interactive else {"PHS_SILENT": 1})
+            code = step(cmd, None if interactive else {"PHS_SILENT": 1})
         finally:
             restore_memory(gid)
         if code != 0:
@@ -1132,12 +1137,17 @@ def _update_all(cfg, args, ids, st, results):
                 last[0] = time.monotonic()
 
         entry = st["guests"].setdefault(gid, {"name": cfg["guests"][gid]["name"], "type": cfg["guests"][gid]["type"]})
+        before = (entry.get("app") or {}).get("installed")
         result, detail = update_guest(cfg, gid, args, progress, entry)
-        results[gid] = (result, detail)
-        entry.update(last_update=now(), last_result=result, last_detail=detail,
-                     reboot_required=(result == "reboot"))
+        reboot = result == "reboot"
         if result in ("ok", "reboot"):
             entry.update(check_guest(cfg, gid))  # refresh pending counts
+            app = entry.get("app") or {}
+            # A command can exit cleanly without updating anything.
+            if not args.no_app and app.get("update_available") and app.get("installed") == before:
+                result, detail = "failed", f"app update finished, but {app.get('label')} is still {before}"
+        results[gid] = (result, detail)
+        entry.update(last_update=now(), last_result=result, last_detail=detail, reboot_required=reboot)
         save_json(STATUS_PATH, st)
         log(f"result: {result} {detail}")
 
