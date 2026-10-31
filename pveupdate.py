@@ -79,22 +79,43 @@ APP_PRESETS = {
     },
 }
 
-# Prints an apt package's upstream version, without its epoch and packaging suffix.
-DPKG_VERSION = "dpkg-query -W -f='${{Version}}' {} | sed 's/^[0-9]*://; s/[-+~].*//'"
-
-# Community-scripts apps that keep no version file, by script name. The apt ones
-# have no latest version here: their updates come with the OS packages.
+# Community-scripts apps that keep no version file, by script name.
 COMMUNITY_APPS = {
     "adguard": {
         # Updates itself from its web interface, so only the binary knows its version.
         "version_cmd": "/opt/AdGuardHome/AdGuardHome --version | sed -n 's/.*version v*//p'",
         "github": "AdguardTeam/AdGuardHome",
     },
-    "grafana": {"version_cmd": DPKG_VERSION.format("grafana")},
-    "mariadb": {"version_cmd": DPKG_VERSION.format("mariadb-server")},
-    "mqtt": {"version_cmd": DPKG_VERSION.format("mosquitto")},
-    "redis": {"version_cmd": DPKG_VERSION.format("redis-server")},
 }
+
+# Apt packages of community-scripts apps, by script name, where they aren't
+# called <name> or <name>-server. The first one installed is the app.
+APT_PACKAGES = {
+    "influxdb": ["influxdb3-core", "influxdb2", "influxdb"],
+    "mongodb": ["mongodb-org"],
+    "mqtt": ["mosquitto"],
+    "omada": ["omadac"],
+    "transmission": ["transmission-daemon"],
+}
+
+# Line 1: installed version of the first installed package. Line 2: the newer or
+# same version apt offers, empty if no repository has the package (a local .deb).
+# Run after OS_CHECK, so the package lists are fresh.
+APT_VERSIONS = r"""
+for p in %s; do
+  v=$(dpkg-query -W -f='${db:Status-Status} ${Version}' "$p" 2>/dev/null)
+  case "$v" in installed\ *) v=${v#installed } ;; *) continue ;; esac
+  c=""
+  if [ -n "$(apt-cache madison "$p" 2>/dev/null)" ]; then
+    c=$(apt-cache policy "$p" | sed -n 's/^ *Candidate: //p')
+    dpkg --compare-versions "$c" gt "$v" 2>/dev/null || c=$v
+  fi
+  echo "$v"
+  echo "$c"
+  exit 0
+done
+exit 1
+"""
 
 OS_CHECK = r"""
 if command -v apt-get >/dev/null; then
@@ -450,6 +471,17 @@ def community_app_source(script_url):
 PIHOLE_VERSION = re.compile(r"version is v?(\S+)\s+\(Latest: v?([^)\s]+)\)", re.I)
 
 
+def apt_versions(gtype, gid, name):
+    """(installed, latest) of a community-scripts app installed with apt; None when unknown."""
+    packages = APT_PACKAGES.get(name, [name, f"{name}-server"])
+    code, out, _ = guest_exec(gtype, gid, APT_VERSIONS % " ".join(map(shlex.quote, packages)))
+    if code != 0:
+        return None, None
+    # Without the epoch, so "1:11.4.5" reads as 11.4.5.
+    versions = [re.sub(r"^\d+:", "", line.strip()) for line in out.splitlines()] + ["", ""]
+    return versions[0] or None, versions[1] or None
+
+
 def app_version(gtype, gid, app, name=None):
     """Returns {label, installed, latest, update_available}; versions are None when unknown."""
     preset = APP_PRESETS.get(app.get("preset", "")) or COMMUNITY_APPS.get(app.get("script_name", ""), {})
@@ -475,6 +507,10 @@ def app_version(gtype, gid, app, name=None):
             code, out, _ = guest_exec(gtype, gid, version_cmd)
             installed = (out.strip().lstrip("v") if code == 0 else "") or None
             latest = latest_github_release(repo) if repo else None
+        if not installed and app.get("script_name") and not app.get("version_cmd"):
+            pkg_installed, pkg_latest = apt_versions(gtype, gid, app["script_name"])
+            if pkg_installed:
+                installed, latest = pkg_installed, pkg_latest
     return {
         "label": label,
         "installed": installed or None,
@@ -649,13 +685,14 @@ def check_guest(cfg, gid):
         res["os"] = lines[1].strip()
     if len(lines) > 2 and lines[2].strip():
         res["os_latest"] = lines[2].strip()
-    app = g.get("app")
-    if app:
-        # Containers tracked before script detection existed: detect once now.
-        if g["type"] == "lxc" and app.get("cmd") == "update" and "script" not in app:
-            if detect_app(g, gid):
-                save_config(cfg)
-        res["app"] = app_version(g["type"], gid, app, g["name"])
+    # Containers that were stopped when tracked, or tracked before script
+    # detection existed: detect now, unless the app step was removed on purpose.
+    app = g.get("app") or {}
+    if g["type"] == "lxc" and not g.get("app_removed") and app.get("cmd", "update") == "update" and "script" not in app:
+        if detect_app(g, gid):
+            save_config(cfg)
+    if g.get("app"):
+        res["app"] = app_version(g["type"], gid, g["app"], g["name"])
     return res
 
 
@@ -1062,8 +1099,10 @@ def cmd_set(cfg, args):
     if args.app_cmd is not None:
         if args.app_cmd:
             g.setdefault("app", {})["cmd"] = args.app_cmd
+            g.pop("app_removed", None)
         else:
             g.pop("app", None)
+            g["app_removed"] = True  # or the next check would detect it again
     if "app" in g and args.id != "default":
         for key in ("version_cmd", "github", "preset"):
             val = getattr(args, key)

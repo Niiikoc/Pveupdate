@@ -48,7 +48,7 @@ Stopped guests are skipped. VMs need the QEMU guest agent installed and enabled.
 
 ## App updates
 
-- **community-scripts containers** are detected when you track them (they have `/usr/bin/update`), and `update` is run after the OS packages. `check` shows the installed version (from `/root/.<app>` or an older `/opt/<app>_version.txt`; Pi-hole, AdGuard Home, Mosquitto, MariaDB, Redis and Grafana are asked directly) and, for apps released on GitHub, the latest one. Any other app without a version file shows as unknown until you give it a `--version-cmd`.
+- **community-scripts containers** are detected when you track them (they have `/usr/bin/update`), and `update` is run after the OS packages. `check` shows the installed version (from `/root/.<app>` or an older `/opt/<app>_version.txt`; Pi-hole and AdGuard Home are asked directly) and, for apps released on GitHub, the latest one. Apps installed with apt (MariaDB, InfluxDB, Mosquitto, Redis, Grafana...) get both versions from apt, and their `update` upgrades all of the container's packages, not just the app. Any other app without a version file shows as unknown until you give it a `--version-cmd`.
 - **Your own installs**: save the command once:
 
 ```bash
@@ -60,8 +60,6 @@ pveupdate set 104 --app-cmd 'systemctl stop myapp && cd /opt/myapp && git pull &
 ```bash
 pveupdate set 104 --version-cmd 'cat /opt/myapp/VERSION' --github owner/myapp
 ```
-
-MariaDB, InfluxDB and other apt-installed apps are covered by the OS step.
 
 ## Home Assistant
 
