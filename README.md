@@ -48,7 +48,8 @@ Stopped guests are skipped. VMs need the QEMU guest agent installed and enabled.
 
 ## App updates
 
-- **community-scripts containers** are detected when you track them (they have `/usr/bin/update`), and `update` is run after the OS packages. `check` shows the installed version (from `/root/.<app>`) and, for apps released on GitHub, the latest one.
+- **community-scripts containers** are detected when you track them (they have `/usr/bin/update`), and `update` is run after the OS packages. `check` shows the installed version (from `/root/.<app>` or an older `/opt/<app>_version.txt`; Pi-hole and AdGuard Home are asked directly) and, for apps released on GitHub, the latest one. Apps installed with apt get both versions from apt, and their app update upgrades only that package instead of running `update`. Any other app without a version file shows as unknown until you give it a `--version-cmd`.
+- **Other guests with an app from apt** are detected on `check` from their running services: if one non-system package provides them, or one matches the guest's name, that package is the app and its app update upgrades only that package. When it isn't clear which service is the app, the guest gets no app step; set one with `--app-cmd` and `--version-cmd`. Debian and Ubuntu guests with systemd only. Container runtimes only count when the guest is named after them. An app from apt is also an OS package, so updating the OS upgrades it too. `pveupdate set ID --app-cmd ''` turns the app step off for good.
 - **Your own installs**: save the command once:
 
 ```bash
@@ -61,8 +62,6 @@ pveupdate set 104 --app-cmd 'systemctl stop myapp && cd /opt/myapp && git pull &
 pveupdate set 104 --version-cmd 'cat /opt/myapp/VERSION' --github owner/myapp
 ```
 
-MariaDB, InfluxDB and other apt-installed apps are covered by the OS step.
-
 ## Home Assistant
 
 Use the **[Proxmox Guest Updates](https://github.com/Niiikoc/ha-pveupdate)** integration (installable through HACS). Guests with an app show up under Settings > Updates when a new app version is out, and Install runs only the app update. OS packages get an "Update OS" button and a pending-packages sensor on each guest's device page, so they never nag you in Updates. You can choose the tracked guests under the integration's Configure. It talks to `pveupdate serve`, a small token-protected API on the host:
@@ -74,7 +73,17 @@ systemctl daemon-reload && systemctl enable --now pveupdate-serve
 pveupdate token      # enter this in the integration
 ```
 
-The API (port 8765) accepts only: read status, list the node's guests, choose which guests are tracked, start a check, update tracked guests, read the log. Every request needs the token. Keep the port on your LAN, and replace the token with `pveupdate token --new`.
+The API (port 8765) accepts only: read status, list the node's guests, choose which guests are tracked, start a check, update tracked guests, read the log. Every request needs the token.
+
+`pveupdate token` prints the token and the fingerprint of the API's self-signed certificate, joined by a dot. Home Assistant only trusts that certificate, so the token can't be read on the network or sent to anything pretending to be your host. Integrations set up with a token alone still connect over plain HTTP; paste the new output under the integration's Reconfigure to move them to HTTPS.
+
+Keeping it locked down:
+
+- Allow port 8765 only from Home Assistant's IP in the Proxmox firewall, and don't port-forward it.
+- Replace a leaked token with `pveupdate token --new`. The old one stops working immediately.
+- `pveupdate set default --remote-track off` stops the API from changing the tracked guests, so the token only reaches the guests you chose on the host.
+
+Updating from before 0.8.0: run `systemctl restart pveupdate-serve` after the `curl` above, so the API picks up HTTPS.
 
 To also check for updates every 6 hours (read-only; updates still only happen when you press Install):
 
@@ -96,6 +105,7 @@ pveupdate set 140 --backup-fallback off
 pveupdate set 102 --keep 5
 pveupdate set 102 --os-cmd '...'     # replace the OS step; '' resets it
 pveupdate set 104 --app-cmd ''       # remove the app step
+pveupdate set default --remote-track off   # choose tracked guests only on the host
 ```
 
 Files on the host:
@@ -106,6 +116,7 @@ Files on the host:
 | `/var/lib/pveupdate/status.json` | last check and update results |
 | `/var/log/pveupdate.log` | output of updates run without a terminal |
 | `/etc/pveupdate.token` | API token for `pveupdate serve` |
+| `/etc/pveupdate.crt`, `/etc/pveupdate.key` | the API's self-signed certificate and private key |
 
 ## Contributing
 

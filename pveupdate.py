@@ -33,6 +33,7 @@ import re
 import secrets
 import shlex
 import socket
+import ssl
 import subprocess
 import sys
 import threading
@@ -45,8 +46,10 @@ STATUS_PATH = os.environ.get("PVEUPDATE_STATUS", "/var/lib/pveupdate/status.json
 LOG_PATH = os.environ.get("PVEUPDATE_LOG", "/var/log/pveupdate.log")
 LOCK_PATH = os.environ.get("PVEUPDATE_LOCK", "/run/pveupdate.lock")
 TOKEN_PATH = os.environ.get("PVEUPDATE_TOKEN", "/etc/pveupdate.token")
+CERT_PATH = os.environ.get("PVEUPDATE_CERT", "/etc/pveupdate.crt")
+KEY_PATH = os.environ.get("PVEUPDATE_KEY", "/etc/pveupdate.key")
 SNAP_PREFIX = "pveupd"
-VERSION = "0.7.1"
+VERSION = "0.8.0"
 EXEC_TIMEOUT = 3600
 
 DEFAULTS = {
@@ -61,6 +64,9 @@ DEFAULTS = {
     # RAM (MB) an LXC gets while its app update runs; apps that compile
     # (Zigbee2MQTT, Obico...) can crawl for hours in 1 GB. 0 = never change.
     "build_memory": 2048,
+    # Whether the API may change the tracked guests. Host-wide. When off, the
+    # API token only reaches the guests chosen on the host.
+    "remote_track": True,
 }
 BACKUP_NOTE = "pveupdate: before update"
 
@@ -72,6 +78,87 @@ APP_PRESETS = {
         "github": "Koenkk/zigbee2mqtt",
     },
 }
+
+# Community-scripts apps that keep no version file, by script name.
+COMMUNITY_APPS = {
+    "adguard": {
+        # Updates itself from its web interface, so only the binary knows its version.
+        "version_cmd": "/opt/AdGuardHome/AdGuardHome --version | sed -n 's/.*version v*//p'",
+        "github": "AdguardTeam/AdGuardHome",
+    },
+}
+
+# Lists what the guest's running services come from. "pkg NAME": the apt package
+# that ships the service. "unit NAME": a service no package owns, installed by hand.
+APT_SERVICES = r"""
+command -v systemctl >/dev/null && command -v dpkg-query >/dev/null || exit 1
+owner() {
+  o=$(dpkg-query -S "$1" 2>/dev/null || dpkg-query -S "${1#/usr}" 2>/dev/null)
+  o=$(printf '%s\n' "$o" | grep -v '^diversion' | head -n1)
+  o=${o%%:*}
+  echo "${o%%,*}"
+}
+systemctl list-units --type=service --state=running --no-legend --plain 2>/dev/null | awk '{print $1}' |
+while read -r unit; do
+  case "$unit" in *getty*) continue ;; esac  # Proxmox writes its own getty units
+  path=$(systemctl show -p SourcePath --value "$unit" 2>/dev/null)
+  [ -n "$path" ] || path=$(systemctl show -p FragmentPath --value "$unit" 2>/dev/null)
+  [ -n "$path" ] || continue
+  pkg=$(owner "$path")
+  if [ -z "$pkg" ]; then
+    case "$path" in /etc/systemd/*|/etc/init.d/*|/usr/local/*|/opt/*) echo "unit $unit"; continue ;; esac
+    # Some packages create their service file when installed, so dpkg doesn't
+    # list it: the program it runs tells the package instead.
+    exe=$(systemctl show -p ExecStart --value "$unit" 2>/dev/null | sed -n 's/^{ path=\([^ ;]*\).*/\1/p' | head -n1)
+    [ -n "$exe" ] && pkg=$(owner "$exe")
+    [ -n "$pkg" ] || continue
+  fi
+  case "$(dpkg-query -W -f='${Priority}' "$pkg" 2>/dev/null)" in required|important|standard) continue ;; esac
+  # postgresql-common ships the service, postgresql is the app.
+  case "$pkg" in *-common)
+    case "$(dpkg-query -W -f='${db:Status-Status}' "${pkg%-common}" 2>/dev/null)" in
+      installed) pkg=${pkg%-common} ;;
+    esac ;;
+  esac
+  echo "pkg $pkg"
+done | sort -u
+"""
+
+# Services every system runs, whatever its purpose: never the guest's app.
+SYSTEM_PACKAGES = {
+    "accountsservice", "anacron", "apparmor", "at", "auditd", "avahi-daemon", "chrony", "cloud-init", "cron", "dbus",
+    "dhcpcd", "dhcpcd-base", "dhcpcd5", "exim4-base", "exim4-daemon-light", "fail2ban", "haveged", "ifupdown",
+    "ifupdown2", "irqbalance", "isc-dhcp-client", "lvm2", "modemmanager", "multipath-tools", "network-manager",
+    "networkd-dispatcher", "nfs-common", "nscd", "nslcd", "ntp", "ntpsec", "open-vm-tools", "openssh-server",
+    "packagekit", "policykit-1", "polkitd", "postfix", "qemu-guest-agent", "rpcbind", "rsyslog", "smartmontools",
+    "snapd", "sssd", "sysstat", "thermald", "udisks2", "ufw", "unattended-upgrades", "uuid-runtime", "wpasupplicant",
+}
+
+# Container runtimes: what they run is the guest's app, so they only count when
+# the guest or its script is named after them.
+RUNTIME_PACKAGES = {"containerd", "containerd.io", "docker-ce", "docker.io", "podman"}
+
+# Line 1: an apt package's installed version. Line 2: the newer or same version
+# apt offers, empty if no repository has the package (a local .deb).
+# Run after OS_CHECK, so the package lists are fresh.
+APT_VERSIONS = r"""
+p=%s
+v=$(dpkg-query -W -f='${db:Status-Status} ${Version}' "$p" 2>/dev/null)
+case "$v" in installed\ *) v=${v#installed } ;; *) exit 1 ;; esac
+c=""
+if [ -n "$(apt-cache madison "$p" 2>/dev/null)" ]; then
+  c=$(apt-cache policy "$p" | sed -n 's/^ *Candidate: //p')
+  dpkg --compare-versions "$c" gt "$v" 2>/dev/null || c=$v
+fi
+echo "$v"
+echo "$c"
+"""
+
+# The app update of a container without community-scripts' `update`: upgrades
+# only the app's package.
+APT_APP_UPGRADE = ("export DEBIAN_FRONTEND=noninteractive; apt-get update -qq && apt-get -y "
+                   "-o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold "
+                   "install --only-upgrade %s")
 
 OS_CHECK = r"""
 if command -v apt-get >/dev/null; then
@@ -128,11 +215,27 @@ true
 """
 
 # Prints the URL of the community-scripts ct script this container was made from.
+# Older `update` commands contain it. Newer ones, rewritten on every update, build
+# it from exported variables, with the script's name falling back to its slug.
 DETECT_APP = r"""
 if [ -x /usr/bin/update ]; then
-  echo "community $(grep -o 'https://[^\"]*/ct/[A-Za-z0-9_.-]*\.sh' /usr/bin/update | head -n1)"
+  var() { sed -n "s/^export $1=\"\([^\"]*\)\".*/\1/p" /usr/bin/update | head -n1; }
+  url=$(grep -o 'https://[^\"]*/ct/[A-Za-z0-9_.-][A-Za-z0-9_.-]*\.sh' /usr/bin/update | head -n1)
+  if [ -z "$url" ]; then
+    base=$(var COMMUNITY_SCRIPTS_URL)
+    name=$(var UPDATE_SCRIPT_NAME)
+    [ -n "$name" ] || name=$(var SCRIPT_SLUG)
+    [ -n "$base" ] && [ -n "$name" ] && url="$base/ct/$name.sh"
+  fi
+  echo "community $url"
 fi
 """
+
+# Pi-hole's own record of its versions, or for v5, which has no such file, its command.
+PIHOLE_INFO = "[ -s /etc/pihole/versions ] && cat /etc/pihole/versions || pihole -v 2>/dev/null"
+
+# `pct exec` doesn't always include these, and many apps' commands live there.
+GUEST_PATH = 'PATH="/usr/local/sbin:/usr/local/bin:${PATH:-/usr/sbin:/usr/bin:/sbin:/bin}"; export PATH\n'
 
 QUIET = False
 
@@ -278,6 +381,7 @@ def guest_exec(gtype, gid, script, env=None, interactive=False, on_line=None):
     """
     if env:
         script = "".join(f"export {k}={shlex.quote(str(v))}\n" for k, v in env.items()) + script
+    script = GUEST_PATH + script
     if gtype == "lxc":
         cmd = ["pct", "exec", gid, "--", "sh", "-c", script]
         if interactive:
@@ -411,42 +515,124 @@ def community_app_source(script_url):
     """From a community-scripts ct script, find (version_file_name, github_repo).
 
     Their update scripts record the installed version in /root/.<app> and
-    compare it with `check_for_gh_release "<app>" "<owner/repo>"`.
+    compare it with `check_for_gh_release "<app>" "<owner/repo>"`. The repo is
+    only returned for GitHub releases, the one source of latest versions here.
     """
+    # The retired Gitea mirror, still in older `update` commands.
+    script_url = re.sub(r"^https://git\.community-scripts\.org/(.+?)/raw/(?:branch|tag|commit)/",
+                        r"https://raw.githubusercontent.com/\1/", script_url)
     body = http_get(script_url) or ""
-    m = re.search(r'check_for_gh_release\s+"([^"]+)"\s+"([^"]+)"', body)
+    m = re.search(r'check_for_(gh_release|gh_tag|gl_release|codeberg_release)\s+"([^"]+)"\s+"([^"]+)"', body)
     if m:
-        return m.group(1).lower().replace(" ", ""), m.group(2)
+        return m.group(2).lower().replace(" ", ""), m.group(3) if m.group(1) == "gh_release" else None
     name = script_url.rsplit("/", 1)[-1].removesuffix(".sh")
+    # Apps that never compare versions on update still record the one they
+    # deployed. The install script may deploy helpers too: only trust the app's.
+    install_body = http_get(script_url.replace(f"/ct/{name}.sh", f"/install/{name}-install.sh")) or ""
+    for deployed, repo in re.findall(r'fetch_and_deploy_gh_release\s+"([^"]+)"\s+"([^"]+)"', install_body):
+        vfile = deployed.lower().replace(" ", "")
+        if len(vfile) >= 3 and (name.lower() in vfile or vfile in name.lower()):
+            return vfile, repo
     return name.lower(), None
 
 
 # `pihole -v`: "Core version is v6.1.4 (Latest: v6.2.1)" (v5: "Pi-hole version is ...").
-PIHOLE_VERSION = re.compile(r"version is v?(\S+)\s+\(Latest: v?([^)\s]+)\)")
+# Off the master branch it prints "Core" and then "    Version is ..." instead.
+PIHOLE_VERSION = re.compile(r"version is v?(\S+)\s+\(Latest: v?([^)\s]+)\)", re.I)
+
+
+def pihole_versions(text):
+    """(installed, latest) from /etc/pihole/versions or `pihole -v`; None when unknown."""
+    def field(key):
+        m = re.search(rf'^{key}="?v?([^"\s]*)', text, re.M)
+        return m.group(1) if m else None
+
+    m = PIHOLE_VERSION.search(text)  # the first match is Core
+    versions = m.groups() if m else (field("CORE_VERSION"), field("GITHUB_CORE_VERSION"))
+    return tuple(None if v in ("", "N/A", "null") else v for v in versions)
+
+
+def find_apt_app(gtype, gid, hints):
+    """The apt package that is this guest's app, going by its running services.
+    hints are names the app may go by. None when it isn't clear which one it is."""
+    hints = [h for h in hints if h and len(h) >= 3]
+    code, out, _ = guest_exec(gtype, gid, APT_SERVICES)
+    rows = [line.split(" ", 1) for line in out.splitlines() if " " in line] if code == 0 else []
+    # System services never match by part of a name: a guest called "server" isn't openssh-server.
+    running = [v for kind, v in rows if kind == "pkg" and v not in SYSTEM_PACKAGES and not v.startswith("systemd")]
+    matches = [p for p in running if any(h in p for h in hints)]
+    if matches:
+        return min(matches, key=len)
+    # A service's package named after the app is the app, even with the service
+    # stopped. A package without a service isn't: a guest called "git" runs more than git.
+    for package in (p for h in hints for p in (h, f"{h}-server")):
+        if (apt_versions(gtype, gid, package)[0]
+                and guest_exec(gtype, gid, f"dpkg -L {shlex.quote(package)} | grep -q '[.]service$'")[0] == 0):
+            return package
+    # One package and nothing installed by hand: nginx next to a hand-installed
+    # app isn't the app, and a guest running several unrelated services has no one app.
+    packages = [p for p in running if p not in RUNTIME_PACKAGES]
+    return packages[0] if len(packages) == 1 and not any(kind == "unit" for kind, _ in rows) else None
+
+
+def apt_versions(gtype, gid, package):
+    """(installed, latest) of an apt package; None when unknown."""
+    code, out, _ = guest_exec(gtype, gid, APT_VERSIONS % shlex.quote(package))
+    if code != 0:
+        return None, None
+    # Without the epoch, so "1:11.4.5" reads as 11.4.5.
+    versions = [re.sub(r"^\d+:", "", line.strip()) for line in out.splitlines()] + ["", ""]
+    return versions[0] or None, versions[1] or None
+
+
+def plausible_version(text):
+    """Whether a file's content can be a version, and not a dotfile of the same
+    name: /root/.profile for a guest called "profile"."""
+    return len(text) <= 64 and any(ch.isdigit() for ch in text) and not re.search(r"[\s=/]", text)
 
 
 def app_version(gtype, gid, app, name=None):
     """Returns {label, installed, latest, update_available}; versions are None when unknown."""
-    preset = APP_PRESETS.get(app.get("preset", ""), {})
+    preset = APP_PRESETS.get(app.get("preset", "")) or COMMUNITY_APPS.get(app.get("script_name", ""), {})
     version_cmd = app.get("version_cmd") or preset.get("version_cmd")
     repo = app.get("github") or preset.get("github")
-    label = app.get("preset") or app.get("script_name") or (repo or "").split("/")[-1] or name or "app"
+    label = (app.get("preset") or app.get("script_name") or app.get("package")
+             or (repo or "").split("/")[-1] or name or "app")
+    script_name = app.get("script_name")
+    # An update command that doesn't name its script: go by the guest's name.
+    app_name = script_name or (name or "").lower()
     installed = latest = None
-    if not version_cmd and app.get("script_name") == "pihole":
+    if not version_cmd and (script_name == "pihole" or not script_name):
         # Pi-hole reports its own installed and latest version.
-        code, out, _ = guest_exec(gtype, gid, "pihole -v 2>/dev/null | head -n 1")
-        m = PIHOLE_VERSION.search(out) if code == 0 else None
-        if m:
-            installed, latest = m.group(1), (None if m.group(2) == "N/A" else m.group(2))
-    else:
-        if not version_cmd and app.get("script"):
-            vfile, gh = community_app_source(app["script"])
-            version_cmd = f"cat /root/.{vfile} 2>/dev/null"
+        code, out, _ = guest_exec(gtype, gid, PIHOLE_INFO)
+        installed, latest = pihole_versions(out) if code == 0 else (None, None)
+        if installed:
+            label = "pihole"
+    if not installed:
+        from_file = not version_cmd
+        if not version_cmd and app_name:
+            vfile, gh = community_app_source(app["script"]) if script_name and app.get("script") else (app_name, None)
+            # Containers not updated since community-scripts moved its version
+            # files still have /opt/<app>_version.txt; a lone one is the app's.
+            version_cmd = (f"cat {shlex.quote('/root/.' + vfile)} 2>/dev/null || "
+                           '{ set -- /opt/*_version.txt; [ $# = 1 ] && cat "$1" 2>/dev/null; }')
             repo = repo or gh
         if version_cmd:
             code, out, _ = guest_exec(gtype, gid, version_cmd)
             installed = (out.strip().lstrip("v") if code == 0 else "") or None
+            if from_file and installed and not plausible_version(installed):
+                installed = None
             latest = latest_github_release(repo) if repo else None
+        if not installed and not app.get("version_cmd"):
+            package = app.get("package") or find_apt_app(gtype, gid, [script_name, (name or "").lower()])
+            pkg_installed, pkg_latest = apt_versions(gtype, gid, package) if package else (None, None)
+            if pkg_installed:
+                installed, latest = pkg_installed, pkg_latest
+                app["package"] = package
+                # Under the script's name only if the package is that app.
+                label = app.get("preset") or (script_name if script_name and script_name in package else package)
+            else:
+                app.pop("package", None)
     return {
         "label": label,
         "installed": installed or None,
@@ -518,7 +704,7 @@ def add_guests(cfg, guests, ids):
         entry = cfg["guests"].setdefault(gid, {"type": g["type"], "name": g["name"]})
         entry["name"] = g["name"]
         print(f"  tracking {gid} {g['name']}")
-        if g["type"] == "lxc" and g["status"] == "running" and "app" not in entry:
+        if g["type"] == "lxc" and g["status"] == "running" and "app" not in entry and not entry.get("app_removed"):
             detect_app(entry, gid)
 
 
@@ -549,13 +735,15 @@ def cmd_untrack(cfg, args):
     save_config(cfg)
 
 
-def detect_app(entry, gid):
+def detect_app(entry, gid, gtype="lxc"):
     """Fill entry['app'] for community-scripts containers. Returns True if changed."""
-    code, out, _ = guest_exec("lxc", gid, DETECT_APP)
+    code, out, _ = guest_exec(gtype, gid, DETECT_APP)
     out = out.strip()
     if code != 0 or not out.startswith("community"):
         return False
     url = out.split(" ", 1)[1] if " " in out else ""
+    if not url and "app" in entry:
+        return False  # an update command that names no script; already known
     name = url.rsplit("/", 1)[-1].removesuffix(".sh")
     app = entry.setdefault("app", {"cmd": "update", "interactive": True})
     if url:
@@ -621,13 +809,28 @@ def check_guest(cfg, gid):
         res["os"] = lines[1].strip()
     if len(lines) > 2 and lines[2].strip():
         res["os_latest"] = lines[2].strip()
-    app = g.get("app")
-    if app:
-        # Containers tracked before script detection existed: detect once now.
-        if g["type"] == "lxc" and app.get("cmd") == "update" and "script" not in app:
-            if detect_app(g, gid):
-                save_config(cfg)
-        res["app"] = app_version(g["type"], gid, app, g["name"])
+    # Containers that were stopped when tracked, or tracked before script
+    # detection existed: detect now, unless the app step was removed on purpose.
+    app = g.get("app") or {}
+    if not g.get("app_removed") and app.get("cmd", "update") == "update" and "script" not in app:
+        changed = detect_app(g, gid, g["type"])
+        # Here and not when tracking: the API must answer Home Assistant quickly.
+        package = find_apt_app(g["type"], gid, [g["name"].lower()]) if "app" not in g else None
+        if package:
+            g["app"] = {"cmd": APT_APP_UPGRADE % shlex.quote(package), "package": package}
+            say(f"    found {package} (apt package): will upgrade it as this guest's app")
+            changed = True
+        if changed:
+            save_config(cfg)
+    if g.get("app"):
+        known = g["app"].get("package")
+        res["app"] = app_version(g["type"], gid, g["app"], g["name"])
+        if g["app"].get("package") != known:
+            # The package this code chose to upgrade is gone: the next check looks again.
+            if known and g["app"].get("cmd") == APT_APP_UPGRADE % shlex.quote(known):
+                del g["app"]
+                del res["app"]
+            save_config(cfg)
     return res
 
 
@@ -836,12 +1039,17 @@ def update_guest(cfg, gid, opts, progress=None, entry=None):
 
     app = g.get("app")
     if app and not opts.no_app:
-        say(f"  running app update: {app['cmd']}")
+        # A version that comes from apt is upgraded by apt: a community-scripts
+        # `update` may finish without touching the package.
+        cmd = app["cmd"]
+        if cmd == "update" and app.get("package"):
+            cmd = APT_APP_UPGRADE % shlex.quote(app["package"])
+        say(f"  running app update: {cmd}")
         progress(PROGRESS_APP[0], "app")
         raise_memory(cfg, gtype, gid)
         try:
             # PHS_SILENT=1 makes community-scripts `update` skip its menu.
-            code = step(app["cmd"], None if interactive else {"PHS_SILENT": 1})
+            code = step(cmd, None if interactive else {"PHS_SILENT": 1})
         finally:
             restore_memory(gid)
         if code != 0:
@@ -929,12 +1137,17 @@ def _update_all(cfg, args, ids, st, results):
                 last[0] = time.monotonic()
 
         entry = st["guests"].setdefault(gid, {"name": cfg["guests"][gid]["name"], "type": cfg["guests"][gid]["type"]})
+        before = (entry.get("app") or {}).get("installed")
         result, detail = update_guest(cfg, gid, args, progress, entry)
-        results[gid] = (result, detail)
-        entry.update(last_update=now(), last_result=result, last_detail=detail,
-                     reboot_required=(result == "reboot"))
+        reboot = result == "reboot"
         if result in ("ok", "reboot"):
             entry.update(check_guest(cfg, gid))  # refresh pending counts
+            app = entry.get("app") or {}
+            # A command can exit cleanly without updating anything.
+            if not args.no_app and app.get("update_available") and app.get("installed") == before:
+                result, detail = "failed", f"app update finished, but {app.get('label')} is still {before}"
+        results[gid] = (result, detail)
+        entry.update(last_update=now(), last_result=result, last_detail=detail, reboot_required=reboot)
         save_json(STATUS_PATH, st)
         log(f"result: {result} {detail}")
 
@@ -971,6 +1184,7 @@ def status_summary(cfg, st, full=False):
     running = is_locked()
     return {
         "version": VERSION,
+        "remote_track": cfg["defaults"]["remote_track"],
         "checked_at": st.get("checked_at"),
         "running": running,
         "activity": st.get("activity") if running else None,
@@ -1009,6 +1223,10 @@ def cmd_set(cfg, args):
         g = cfg["guests"][args.id]
     else:
         sys.exit(f"{args.id} is not tracked (run `track` first)")
+    if args.remote_track is not None:
+        if args.id != "default":
+            sys.exit("--remote-track applies to the whole host: use `pveupdate set default --remote-track ...`")
+        g["remote_track"] = args.remote_track == "on"
     if args.backup_fallback is not None:
         g["backup_fallback"] = args.backup_fallback == "on"
     if args.backup_storage is not None:
@@ -1029,8 +1247,10 @@ def cmd_set(cfg, args):
     if args.app_cmd is not None:
         if args.app_cmd:
             g.setdefault("app", {})["cmd"] = args.app_cmd
+            g.pop("app_removed", None)
         else:
             g.pop("app", None)
+            g["app_removed"] = True  # or the next check would detect it again
     if "app" in g and args.id != "default":
         for key in ("version_cmd", "github", "preset"):
             val = getattr(args, key)
@@ -1043,9 +1263,11 @@ def cmd_set(cfg, args):
 # ---------------------------------------------------------------- HTTP API
 
 def load_token(create=False):
-    if os.path.exists(TOKEN_PATH):
+    try:
         with open(TOKEN_PATH) as f:
             return f.read().strip()
+    except FileNotFoundError:
+        pass
     if not create:
         return None
     token = secrets.token_urlsafe(32)
@@ -1053,6 +1275,41 @@ def load_token(create=False):
     with os.fdopen(fd, "w") as f:
         f.write(token + "\n")
     return token
+
+
+def ensure_cert():
+    """Self-signed certificate for the API, created on first use. Returns its
+    SHA-256 fingerprint in hex, or None if it can't be created."""
+    os.makedirs(os.path.dirname(LOCK_PATH), exist_ok=True)
+    # `serve` and `token` can both get here on a fresh install.
+    with open(LOCK_PATH + ".cert", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if not (os.path.exists(CERT_PATH) and os.path.exists(KEY_PATH)):
+            old_umask = os.umask(0o077)
+            try:
+                r = run(["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
+                         "-nodes", "-sha256", "-days", "36500", "-subj", "/CN=pveupdate",
+                         "-keyout", KEY_PATH, "-out", CERT_PATH], check=False)
+            except OSError:
+                return None
+            finally:
+                os.umask(old_umask)
+            if r.returncode != 0:
+                return None
+    with open(CERT_PATH) as f:
+        return hashlib.sha256(ssl.PEM_cert_to_DER_cert(f.read())).hexdigest()
+
+
+def tls_context():
+    """Server TLS context, or None if the certificate can't be set up."""
+    if not ensure_cert():
+        return None
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(CERT_PATH, KEY_PATH)
+    except (OSError, ssl.SSLError):
+        return None
+    return ctx
 
 
 def spawn(*cli_args):
@@ -1065,10 +1322,10 @@ def spawn(*cli_args):
 
 
 class ApiHandler(BaseHTTPRequestHandler):
-    token = ""
     start_lock = threading.Lock()
     last_start = 0.0
     server_version = "pveupdate"
+    timeout = 30
 
     def log_message(self, fmt, *a):
         pass
@@ -1083,8 +1340,12 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     def _authorized(self):
         auth = self.headers.get("Authorization", "")
-        given = auth[7:] if auth.startswith("Bearer ") else ""
-        if given and hmac.compare_digest(given, self.token):
+        # What `pveupdate token` prints also has the certificate's fingerprint
+        # after a dot; only the part before it is the secret.
+        given = (auth[7:] if auth.startswith("Bearer ") else "").split(".", 1)[0]
+        # Read on every request, so `pveupdate token --new` applies right away.
+        token = load_token()
+        if token and given and hmac.compare_digest(given.encode(), token.encode()):
             return True
         self._send(401, {"error": "invalid or missing token"})
         return False
@@ -1139,6 +1400,9 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     def _track(self):
         """Set the tracked guests to exactly the given list of IDs."""
+        if not load_config()["defaults"]["remote_track"]:
+            self._send(403, {"error": "tracked guests can only be changed on the host (remote_track is off)"})
+            return
         body = self._body()
         ids = (body or {}).get("guests")
         if not isinstance(ids, list):
@@ -1196,18 +1460,44 @@ class ApiHandler(BaseHTTPRequestHandler):
         self._send(202, {"started": "update", "guests": ids, "part": part})
 
 
+class ApiServer(ThreadingHTTPServer):
+    """HTTPS, and on the same port plain HTTP for integrations set up before 0.8.0."""
+
+    tls = None
+
+    def finish_request(self, request, client_address):
+        # Runs in the connection's own thread, so a slow client holds up nobody else.
+        request.settimeout(ApiHandler.timeout)
+        secure = False
+        try:
+            # 0x16 starts a TLS handshake; plain HTTP starts with a method name.
+            if self.tls and request.recv(1, socket.MSG_PEEK) == b"\x16":
+                request = self.tls.wrap_socket(request, server_side=True)
+                secure = True
+        except OSError:  # includes failed handshakes and timeouts
+            return
+        try:
+            super().finish_request(request, client_address)
+        finally:
+            if secure:
+                request.close()
+
+
 def cmd_serve(cfg, args):
-    token = load_token(create=True)
-    ApiHandler.token = token
-    server = ThreadingHTTPServer((args.bind, args.port), ApiHandler)
-    print(f"pveupdate API listening on {args.bind}:{args.port} (token in {TOKEN_PATH})", flush=True)
+    load_token(create=True)
+    server = ApiServer((args.bind, args.port), ApiHandler)
+    server.tls = tls_context()
+    mode = "HTTPS and HTTP" if server.tls else "HTTP only, could not set up a certificate"
+    print(f"pveupdate API listening on {args.bind}:{args.port}, {mode} (token in {TOKEN_PATH})", flush=True)
     server.serve_forever()
 
 
 def cmd_token(cfg, args):
     if args.new and os.path.exists(TOKEN_PATH):
         os.remove(TOKEN_PATH)
-    print(load_token(create=True))
+    token = load_token(create=True)
+    fingerprint = ensure_cert()
+    print(f"{token}.{fingerprint}" if fingerprint else token)
 
 
 def menu(cfg):
@@ -1253,7 +1543,7 @@ def main():
     psv = sub.add_parser("serve", help="run the HTTP API for the Home Assistant integration")
     psv.add_argument("--bind", default="0.0.0.0")
     psv.add_argument("--port", type=int, default=8765)
-    ptk = sub.add_parser("token", help="print the API token (created on first use)")
+    ptk = sub.add_parser("token", help="print the API token and certificate fingerprint (created on first use)")
     ptk.add_argument("--new", action="store_true", help="replace the token with a new one")
     pst = sub.add_parser("status", help="show the last check/update results")
     pst.add_argument("--json", action="store_true")
@@ -1261,6 +1551,8 @@ def main():
     ps = sub.add_parser("set", help="change a tracked guest's settings")
     ps.add_argument("id", help="guest ID, or `default` for all guests")
     ps.add_argument("--snapshot", choices=["on", "off"])
+    ps.add_argument("--remote-track", choices=["on", "off"],
+                    help="let the API change the tracked guests (default on; only with `default`)")
     ps.add_argument("--backup-fallback", choices=["on", "off"],
                     help="take a vzdump backup when a snapshot isn't possible (default on)")
     ps.add_argument("--backup-storage", help="storage for fallback backups ('' = auto)")
