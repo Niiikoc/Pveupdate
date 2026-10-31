@@ -92,19 +92,26 @@ COMMUNITY_APPS = {
 # that ships the service. "unit NAME": a service no package owns, installed by hand.
 APT_SERVICES = r"""
 command -v systemctl >/dev/null && command -v dpkg-query >/dev/null || exit 1
+owner() {
+  o=$(dpkg-query -S "$1" 2>/dev/null || dpkg-query -S "${1#/usr}" 2>/dev/null)
+  o=$(printf '%s\n' "$o" | grep -v '^diversion' | head -n1)
+  o=${o%%:*}
+  echo "${o%%,*}"
+}
 systemctl list-units --type=service --state=running --no-legend --plain 2>/dev/null | awk '{print $1}' |
 while read -r unit; do
   case "$unit" in *getty*) continue ;; esac  # Proxmox writes its own getty units
   path=$(systemctl show -p SourcePath --value "$unit" 2>/dev/null)
   [ -n "$path" ] || path=$(systemctl show -p FragmentPath --value "$unit" 2>/dev/null)
   [ -n "$path" ] || continue
-  pkg=$(dpkg-query -S "$path" 2>/dev/null || dpkg-query -S "${path#/usr}" 2>/dev/null)
-  pkg=$(printf '%s\n' "$pkg" | grep -v '^diversion' | head -n1)
-  pkg=${pkg%%:*}
-  pkg=${pkg%%,*}
+  pkg=$(owner "$path")
   if [ -z "$pkg" ]; then
-    case "$path" in /etc/systemd/*|/etc/init.d/*|/usr/local/*|/opt/*) echo "unit $unit" ;; esac
-    continue
+    case "$path" in /etc/systemd/*|/etc/init.d/*|/usr/local/*|/opt/*) echo "unit $unit"; continue ;; esac
+    # Some packages create their service file when installed, so dpkg doesn't
+    # list it: the program it runs tells the package instead.
+    exe=$(systemctl show -p ExecStart --value "$unit" 2>/dev/null | sed -n 's/^{ path=\([^ ;]*\).*/\1/p' | head -n1)
+    [ -n "$exe" ] && pkg=$(owner "$exe")
+    [ -n "$pkg" ] || continue
   fi
   case "$(dpkg-query -W -f='${Priority}' "$pkg" 2>/dev/null)" in required|important|standard) continue ;; esac
   # postgresql-common ships the service, postgresql is the app.
@@ -119,12 +126,17 @@ done | sort -u
 
 # Services every system runs, whatever its purpose: never the guest's app.
 SYSTEM_PACKAGES = {
-    "accountsservice", "chrony", "cloud-init", "cron", "dbus", "dhcpcd-base", "exim4-base", "exim4-daemon-light",
-    "fail2ban", "ifupdown", "ifupdown2", "irqbalance", "isc-dhcp-client", "lvm2", "multipath-tools",
-    "networkd-dispatcher", "nfs-common", "ntp", "ntpsec", "open-vm-tools", "openssh-server", "packagekit",
-    "policykit-1", "polkitd", "postfix", "qemu-guest-agent", "rpcbind", "rsyslog", "snapd", "thermald", "udisks2",
-    "unattended-upgrades",
+    "accountsservice", "anacron", "apparmor", "at", "auditd", "avahi-daemon", "chrony", "cloud-init", "cron", "dbus",
+    "dhcpcd", "dhcpcd-base", "dhcpcd5", "exim4-base", "exim4-daemon-light", "fail2ban", "haveged", "ifupdown",
+    "ifupdown2", "irqbalance", "isc-dhcp-client", "lvm2", "modemmanager", "multipath-tools", "network-manager",
+    "networkd-dispatcher", "nfs-common", "nscd", "nslcd", "ntp", "ntpsec", "open-vm-tools", "openssh-server",
+    "packagekit", "policykit-1", "polkitd", "postfix", "qemu-guest-agent", "rpcbind", "rsyslog", "smartmontools",
+    "snapd", "sssd", "sysstat", "thermald", "udisks2", "ufw", "unattended-upgrades", "uuid-runtime", "wpasupplicant",
 }
+
+# Container runtimes: what they run is the guest's app, so they only count when
+# the guest or its script is named after them.
+RUNTIME_PACKAGES = {"containerd", "containerd.io", "docker-ce", "docker.io", "podman"}
 
 # Line 1: an apt package's installed version. Line 2: the newer or same version
 # apt offers, empty if no repository has the package (a local .deb).
@@ -205,7 +217,7 @@ true
 # Prints the URL of the community-scripts ct script this container was made from.
 DETECT_APP = r"""
 if [ -x /usr/bin/update ]; then
-  echo "community $(grep -o 'https://[^\"]*/ct/[A-Za-z0-9_.-]\+\.sh' /usr/bin/update | head -n1)"
+  echo "community $(grep -o 'https://[^\"]*/ct/[A-Za-z0-9_.-][A-Za-z0-9_.-]*\.sh' /usr/bin/update | head -n1)"
 fi
 """
 
@@ -499,7 +511,7 @@ def community_app_source(script_url):
     install_body = http_get(script_url.replace(f"/ct/{name}.sh", f"/install/{name}-install.sh")) or ""
     for deployed, repo in re.findall(r'fetch_and_deploy_gh_release\s+"([^"]+)"\s+"([^"]+)"', install_body):
         vfile = deployed.lower().replace(" ", "")
-        if name.lower() in vfile or vfile in name.lower():
+        if len(vfile) >= 3 and (name.lower() in vfile or vfile in name.lower()):
             return vfile, repo
     return name.lower(), None
 
@@ -512,16 +524,23 @@ PIHOLE_VERSION = re.compile(r"version is v?(\S+)\s+\(Latest: v?([^)\s]+)\)", re.
 def find_apt_app(gtype, gid, hints):
     """The apt package that is this guest's app, going by its running services.
     hints are names the app may go by. None when it isn't clear which one it is."""
+    hints = [h for h in hints if h and len(h) >= 3]
     code, out, _ = guest_exec(gtype, gid, APT_SERVICES)
-    if code != 0:
-        return None
-    rows = [line.split(" ", 1) for line in out.splitlines() if " " in line]
-    packages = [v for kind, v in rows if kind == "pkg" and v not in SYSTEM_PACKAGES and not v.startswith("systemd")]
-    matches = [p for p in packages if any(h and len(h) >= 3 and h in p for h in hints)]
+    rows = [line.split(" ", 1) for line in out.splitlines() if " " in line] if code == 0 else []
+    # System services never match by part of a name: a guest called "server" isn't openssh-server.
+    running = [v for kind, v in rows if kind == "pkg" and v not in SYSTEM_PACKAGES and not v.startswith("systemd")]
+    matches = [p for p in running if any(h in p for h in hints)]
     if matches:
         return min(matches, key=len)
+    # A service's package named after the app is the app, even with the service
+    # stopped. A package without a service isn't: a guest called "git" runs more than git.
+    for package in (p for h in hints for p in (h, f"{h}-server")):
+        if (apt_versions(gtype, gid, package)[0]
+                and guest_exec(gtype, gid, f"dpkg -L {shlex.quote(package)} | grep -q '[.]service$'")[0] == 0):
+            return package
     # One package and nothing installed by hand: nginx next to a hand-installed
     # app isn't the app, and a guest running several unrelated services has no one app.
+    packages = [p for p in running if p not in RUNTIME_PACKAGES]
     return packages[0] if len(packages) == 1 and not any(kind == "unit" for kind, _ in rows) else None
 
 
@@ -533,6 +552,12 @@ def apt_versions(gtype, gid, package):
     # Without the epoch, so "1:11.4.5" reads as 11.4.5.
     versions = [re.sub(r"^\d+:", "", line.strip()) for line in out.splitlines()] + ["", ""]
     return versions[0] or None, versions[1] or None
+
+
+def plausible_version(text):
+    """Whether a file's content can be a version, and not a dotfile of the same
+    name: /root/.profile for a guest called "profile"."""
+    return len(text) <= 64 and any(ch.isdigit() for ch in text) and not re.search(r"[\s=/]", text)
 
 
 def app_version(gtype, gid, app, name=None):
@@ -554,6 +579,7 @@ def app_version(gtype, gid, app, name=None):
             installed, latest = (None if v == "N/A" else v for v in m.groups())
             label = "pihole"
     if not installed:
+        from_file = not version_cmd
         if not version_cmd and app_name:
             vfile, gh = community_app_source(app["script"]) if script_name and app.get("script") else (app_name, None)
             # Containers not updated since community-scripts moved its version
@@ -564,6 +590,8 @@ def app_version(gtype, gid, app, name=None):
         if version_cmd:
             code, out, _ = guest_exec(gtype, gid, version_cmd)
             installed = (out.strip().lstrip("v") if code == 0 else "") or None
+            if from_file and installed and not plausible_version(installed):
+                installed = None
             latest = latest_github_release(repo) if repo else None
         if not installed and not app.get("version_cmd"):
             package = app.get("package") or find_apt_app(gtype, gid, [script_name, (name or "").lower()])
@@ -571,7 +599,8 @@ def app_version(gtype, gid, app, name=None):
             if pkg_installed:
                 installed, latest = pkg_installed, pkg_latest
                 app["package"] = package
-                label = app.get("preset") or script_name or package
+                # Under the script's name only if the package is that app.
+                label = app.get("preset") or (script_name if script_name and script_name in package else package)
             else:
                 app.pop("package", None)
     return {
@@ -645,7 +674,7 @@ def add_guests(cfg, guests, ids):
         entry = cfg["guests"].setdefault(gid, {"type": g["type"], "name": g["name"]})
         entry["name"] = g["name"]
         print(f"  tracking {gid} {g['name']}")
-        if g["type"] == "lxc" and g["status"] == "running" and "app" not in entry:
+        if g["type"] == "lxc" and g["status"] == "running" and "app" not in entry and not entry.get("app_removed"):
             detect_app(entry, gid)
 
 
@@ -677,16 +706,9 @@ def cmd_untrack(cfg, args):
 
 
 def detect_app(entry, gid, gtype="lxc"):
-    """Fill entry['app'] for community-scripts containers and apps installed with
-    apt. Returns True if changed."""
+    """Fill entry['app'] for community-scripts containers. Returns True if changed."""
     code, out, _ = guest_exec(gtype, gid, DETECT_APP)
     out = out.strip()
-    if code == 0 and not out and "app" not in entry:
-        package = find_apt_app(gtype, gid, [entry.get("name", "").lower()])
-        if package:
-            entry["app"] = {"cmd": APT_APP_UPGRADE % package, "package": package}
-            say(f"    found {package} (apt package): will upgrade it as this guest's app")
-            return True
     if code != 0 or not out.startswith("community"):
         return False
     url = out.split(" ", 1)[1] if " " in out else ""
@@ -761,12 +783,23 @@ def check_guest(cfg, gid):
     # detection existed: detect now, unless the app step was removed on purpose.
     app = g.get("app") or {}
     if not g.get("app_removed") and app.get("cmd", "update") == "update" and "script" not in app:
-        if detect_app(g, gid, g["type"]):
+        changed = detect_app(g, gid, g["type"])
+        # Here and not when tracking: the API must answer Home Assistant quickly.
+        package = find_apt_app(g["type"], gid, [g["name"].lower()]) if "app" not in g else None
+        if package:
+            g["app"] = {"cmd": APT_APP_UPGRADE % shlex.quote(package), "package": package}
+            say(f"    found {package} (apt package): will upgrade it as this guest's app")
+            changed = True
+        if changed:
             save_config(cfg)
     if g.get("app"):
         known = g["app"].get("package")
         res["app"] = app_version(g["type"], gid, g["app"], g["name"])
         if g["app"].get("package") != known:
+            # The package this code chose to upgrade is gone: the next check looks again.
+            if known and g["app"].get("cmd") == APT_APP_UPGRADE % shlex.quote(known):
+                del g["app"]
+                del res["app"]
             save_config(cfg)
     return res
 
