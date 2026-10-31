@@ -215,11 +215,27 @@ true
 """
 
 # Prints the URL of the community-scripts ct script this container was made from.
+# Older `update` commands contain it. Newer ones, rewritten on every update, build
+# it from exported variables, with the script's name falling back to its slug.
 DETECT_APP = r"""
 if [ -x /usr/bin/update ]; then
-  echo "community $(grep -o 'https://[^\"]*/ct/[A-Za-z0-9_.-][A-Za-z0-9_.-]*\.sh' /usr/bin/update | head -n1)"
+  var() { sed -n "s/^export $1=\"\([^\"]*\)\".*/\1/p" /usr/bin/update | head -n1; }
+  url=$(grep -o 'https://[^\"]*/ct/[A-Za-z0-9_.-][A-Za-z0-9_.-]*\.sh' /usr/bin/update | head -n1)
+  if [ -z "$url" ]; then
+    base=$(var COMMUNITY_SCRIPTS_URL)
+    name=$(var UPDATE_SCRIPT_NAME)
+    [ -n "$name" ] || name=$(var SCRIPT_SLUG)
+    [ -n "$base" ] && [ -n "$name" ] && url="$base/ct/$name.sh"
+  fi
+  echo "community $url"
 fi
 """
+
+# Pi-hole's own record of its versions, or for v5, which has no such file, its command.
+PIHOLE_INFO = "[ -s /etc/pihole/versions ] && cat /etc/pihole/versions || pihole -v 2>/dev/null"
+
+# `pct exec` doesn't always include these, and many apps' commands live there.
+GUEST_PATH = 'PATH="/usr/local/sbin:/usr/local/bin:${PATH:-/usr/sbin:/usr/bin:/sbin:/bin}"; export PATH\n'
 
 QUIET = False
 
@@ -365,6 +381,7 @@ def guest_exec(gtype, gid, script, env=None, interactive=False, on_line=None):
     """
     if env:
         script = "".join(f"export {k}={shlex.quote(str(v))}\n" for k, v in env.items()) + script
+    script = GUEST_PATH + script
     if gtype == "lxc":
         cmd = ["pct", "exec", gid, "--", "sh", "-c", script]
         if interactive:
@@ -501,6 +518,9 @@ def community_app_source(script_url):
     compare it with `check_for_gh_release "<app>" "<owner/repo>"`. The repo is
     only returned for GitHub releases, the one source of latest versions here.
     """
+    # The retired Gitea mirror, still in older `update` commands.
+    script_url = re.sub(r"^https://git\.community-scripts\.org/(.+?)/raw/(?:branch|tag|commit)/",
+                        r"https://raw.githubusercontent.com/\1/", script_url)
     body = http_get(script_url) or ""
     m = re.search(r'check_for_(gh_release|gh_tag|gl_release|codeberg_release)\s+"([^"]+)"\s+"([^"]+)"', body)
     if m:
@@ -519,6 +539,17 @@ def community_app_source(script_url):
 # `pihole -v`: "Core version is v6.1.4 (Latest: v6.2.1)" (v5: "Pi-hole version is ...").
 # Off the master branch it prints "Core" and then "    Version is ..." instead.
 PIHOLE_VERSION = re.compile(r"version is v?(\S+)\s+\(Latest: v?([^)\s]+)\)", re.I)
+
+
+def pihole_versions(text):
+    """(installed, latest) from /etc/pihole/versions or `pihole -v`; None when unknown."""
+    def field(key):
+        m = re.search(rf'^{key}="?v?([^"\s]*)', text, re.M)
+        return m.group(1) if m else None
+
+    m = PIHOLE_VERSION.search(text)  # the first match is Core
+    versions = m.groups() if m else (field("CORE_VERSION"), field("GITHUB_CORE_VERSION"))
+    return tuple(None if v in ("", "N/A", "null") else v for v in versions)
 
 
 def find_apt_app(gtype, gid, hints):
@@ -573,10 +604,9 @@ def app_version(gtype, gid, app, name=None):
     installed = latest = None
     if not version_cmd and (script_name == "pihole" or not script_name):
         # Pi-hole reports its own installed and latest version.
-        code, out, _ = guest_exec(gtype, gid, "pihole -v 2>/dev/null")
-        m = PIHOLE_VERSION.search(out) if code == 0 else None  # the first match is Core
-        if m:
-            installed, latest = (None if v == "N/A" else v for v in m.groups())
+        code, out, _ = guest_exec(gtype, gid, PIHOLE_INFO)
+        installed, latest = pihole_versions(out) if code == 0 else (None, None)
+        if installed:
             label = "pihole"
     if not installed:
         from_file = not version_cmd
