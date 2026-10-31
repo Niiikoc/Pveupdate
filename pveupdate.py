@@ -88,34 +88,65 @@ COMMUNITY_APPS = {
     },
 }
 
-# Apt packages of community-scripts apps, by script name, where they aren't
-# called <name> or <name>-server. The first one installed is the app.
-APT_PACKAGES = {
-    "influxdb": ["influxdb3-core", "influxdb2", "influxdb"],
-    "mongodb": ["mongodb-org"],
-    "mqtt": ["mosquitto"],
-    "omada": ["omadac"],
-    "transmission": ["transmission-daemon"],
+# Lists what the guest's running services come from. "pkg NAME": the apt package
+# that ships the service. "unit NAME": a service no package owns, installed by hand.
+APT_SERVICES = r"""
+command -v systemctl >/dev/null && command -v dpkg-query >/dev/null || exit 1
+systemctl list-units --type=service --state=running --no-legend --plain 2>/dev/null | awk '{print $1}' |
+while read -r unit; do
+  case "$unit" in *getty*) continue ;; esac  # Proxmox writes its own getty units
+  path=$(systemctl show -p SourcePath --value "$unit" 2>/dev/null)
+  [ -n "$path" ] || path=$(systemctl show -p FragmentPath --value "$unit" 2>/dev/null)
+  [ -n "$path" ] || continue
+  pkg=$(dpkg-query -S "$path" 2>/dev/null || dpkg-query -S "${path#/usr}" 2>/dev/null)
+  pkg=$(printf '%s\n' "$pkg" | grep -v '^diversion' | head -n1)
+  pkg=${pkg%%:*}
+  pkg=${pkg%%,*}
+  if [ -z "$pkg" ]; then
+    case "$path" in /etc/systemd/*|/etc/init.d/*|/usr/local/*|/opt/*) echo "unit $unit" ;; esac
+    continue
+  fi
+  case "$(dpkg-query -W -f='${Priority}' "$pkg" 2>/dev/null)" in required|important|standard) continue ;; esac
+  # postgresql-common ships the service, postgresql is the app.
+  case "$pkg" in *-common)
+    case "$(dpkg-query -W -f='${db:Status-Status}' "${pkg%-common}" 2>/dev/null)" in
+      installed) pkg=${pkg%-common} ;;
+    esac ;;
+  esac
+  echo "pkg $pkg"
+done | sort -u
+"""
+
+# Services every system runs, whatever its purpose: never the guest's app.
+SYSTEM_PACKAGES = {
+    "accountsservice", "chrony", "cloud-init", "cron", "dbus", "dhcpcd-base", "exim4-base", "exim4-daemon-light",
+    "fail2ban", "ifupdown", "ifupdown2", "irqbalance", "isc-dhcp-client", "lvm2", "multipath-tools",
+    "networkd-dispatcher", "nfs-common", "ntp", "ntpsec", "open-vm-tools", "openssh-server", "packagekit",
+    "policykit-1", "polkitd", "postfix", "qemu-guest-agent", "rpcbind", "rsyslog", "snapd", "thermald", "udisks2",
+    "unattended-upgrades",
 }
 
-# Line 1: installed version of the first installed package. Line 2: the newer or
-# same version apt offers, empty if no repository has the package (a local .deb).
+# Line 1: an apt package's installed version. Line 2: the newer or same version
+# apt offers, empty if no repository has the package (a local .deb).
 # Run after OS_CHECK, so the package lists are fresh.
 APT_VERSIONS = r"""
-for p in %s; do
-  v=$(dpkg-query -W -f='${db:Status-Status} ${Version}' "$p" 2>/dev/null)
-  case "$v" in installed\ *) v=${v#installed } ;; *) continue ;; esac
-  c=""
-  if [ -n "$(apt-cache madison "$p" 2>/dev/null)" ]; then
-    c=$(apt-cache policy "$p" | sed -n 's/^ *Candidate: //p')
-    dpkg --compare-versions "$c" gt "$v" 2>/dev/null || c=$v
-  fi
-  echo "$v"
-  echo "$c"
-  exit 0
-done
-exit 1
+p=%s
+v=$(dpkg-query -W -f='${db:Status-Status} ${Version}' "$p" 2>/dev/null)
+case "$v" in installed\ *) v=${v#installed } ;; *) exit 1 ;; esac
+c=""
+if [ -n "$(apt-cache madison "$p" 2>/dev/null)" ]; then
+  c=$(apt-cache policy "$p" | sed -n 's/^ *Candidate: //p')
+  dpkg --compare-versions "$c" gt "$v" 2>/dev/null || c=$v
+fi
+echo "$v"
+echo "$c"
 """
+
+# The app update of a container without community-scripts' `update`: upgrades
+# only the app's package.
+APT_APP_UPGRADE = ("export DEBIAN_FRONTEND=noninteractive; apt-get update -qq && apt-get -y "
+                   "-o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold "
+                   "install --only-upgrade %s")
 
 OS_CHECK = r"""
 if command -v apt-get >/dev/null; then
@@ -174,7 +205,7 @@ true
 # Prints the URL of the community-scripts ct script this container was made from.
 DETECT_APP = r"""
 if [ -x /usr/bin/update ]; then
-  echo "community $(grep -o 'https://[^\"]*/ct/[A-Za-z0-9_.-]*\.sh' /usr/bin/update | head -n1)"
+  echo "community $(grep -o 'https://[^\"]*/ct/[A-Za-z0-9_.-]\+\.sh' /usr/bin/update | head -n1)"
 fi
 """
 
@@ -463,6 +494,13 @@ def community_app_source(script_url):
     if m:
         return m.group(2).lower().replace(" ", ""), m.group(3) if m.group(1) == "gh_release" else None
     name = script_url.rsplit("/", 1)[-1].removesuffix(".sh")
+    # Apps that never compare versions on update still record the one they
+    # deployed. The install script may deploy helpers too: only trust the app's.
+    install_body = http_get(script_url.replace(f"/ct/{name}.sh", f"/install/{name}-install.sh")) or ""
+    for deployed, repo in re.findall(r'fetch_and_deploy_gh_release\s+"([^"]+)"\s+"([^"]+)"', install_body):
+        vfile = deployed.lower().replace(" ", "")
+        if name.lower() in vfile or vfile in name.lower():
+            return vfile, repo
     return name.lower(), None
 
 
@@ -471,10 +509,25 @@ def community_app_source(script_url):
 PIHOLE_VERSION = re.compile(r"version is v?(\S+)\s+\(Latest: v?([^)\s]+)\)", re.I)
 
 
-def apt_versions(gtype, gid, name):
-    """(installed, latest) of a community-scripts app installed with apt; None when unknown."""
-    packages = APT_PACKAGES.get(name, [name, f"{name}-server"])
-    code, out, _ = guest_exec(gtype, gid, APT_VERSIONS % " ".join(map(shlex.quote, packages)))
+def find_apt_app(gtype, gid, hints):
+    """The apt package that is this guest's app, going by its running services.
+    hints are names the app may go by. None when it isn't clear which one it is."""
+    code, out, _ = guest_exec(gtype, gid, APT_SERVICES)
+    if code != 0:
+        return None
+    rows = [line.split(" ", 1) for line in out.splitlines() if " " in line]
+    packages = [v for kind, v in rows if kind == "pkg" and v not in SYSTEM_PACKAGES and not v.startswith("systemd")]
+    matches = [p for p in packages if any(h and len(h) >= 3 and h in p for h in hints)]
+    if matches:
+        return min(matches, key=len)
+    # One package and nothing installed by hand: nginx next to a hand-installed
+    # app isn't the app, and a guest running several unrelated services has no one app.
+    return packages[0] if len(packages) == 1 and not any(kind == "unit" for kind, _ in rows) else None
+
+
+def apt_versions(gtype, gid, package):
+    """(installed, latest) of an apt package; None when unknown."""
+    code, out, _ = guest_exec(gtype, gid, APT_VERSIONS % shlex.quote(package))
     if code != 0:
         return None, None
     # Without the epoch, so "1:11.4.5" reads as 11.4.5.
@@ -487,30 +540,40 @@ def app_version(gtype, gid, app, name=None):
     preset = APP_PRESETS.get(app.get("preset", "")) or COMMUNITY_APPS.get(app.get("script_name", ""), {})
     version_cmd = app.get("version_cmd") or preset.get("version_cmd")
     repo = app.get("github") or preset.get("github")
-    label = app.get("preset") or app.get("script_name") or (repo or "").split("/")[-1] or name or "app"
+    label = (app.get("preset") or app.get("script_name") or app.get("package")
+             or (repo or "").split("/")[-1] or name or "app")
+    script_name = app.get("script_name")
+    # An update command that doesn't name its script: go by the guest's name.
+    app_name = script_name or (name or "").lower()
     installed = latest = None
-    if not version_cmd and app.get("script_name") == "pihole":
+    if not version_cmd and (script_name == "pihole" or not script_name):
         # Pi-hole reports its own installed and latest version.
         code, out, _ = guest_exec(gtype, gid, "pihole -v 2>/dev/null")
         m = PIHOLE_VERSION.search(out) if code == 0 else None  # the first match is Core
         if m:
             installed, latest = (None if v == "N/A" else v for v in m.groups())
-    else:
-        if not version_cmd and app.get("script"):
-            vfile, gh = community_app_source(app["script"])
+            label = "pihole"
+    if not installed:
+        if not version_cmd and app_name:
+            vfile, gh = community_app_source(app["script"]) if script_name and app.get("script") else (app_name, None)
             # Containers not updated since community-scripts moved its version
             # files still have /opt/<app>_version.txt; a lone one is the app's.
-            version_cmd = (f"cat /root/.{vfile} 2>/dev/null || "
+            version_cmd = (f"cat {shlex.quote('/root/.' + vfile)} 2>/dev/null || "
                            '{ set -- /opt/*_version.txt; [ $# = 1 ] && cat "$1" 2>/dev/null; }')
             repo = repo or gh
         if version_cmd:
             code, out, _ = guest_exec(gtype, gid, version_cmd)
             installed = (out.strip().lstrip("v") if code == 0 else "") or None
             latest = latest_github_release(repo) if repo else None
-        if not installed and app.get("script_name") and not app.get("version_cmd"):
-            pkg_installed, pkg_latest = apt_versions(gtype, gid, app["script_name"])
+        if not installed and not app.get("version_cmd"):
+            package = app.get("package") or find_apt_app(gtype, gid, [script_name, (name or "").lower()])
+            pkg_installed, pkg_latest = apt_versions(gtype, gid, package) if package else (None, None)
             if pkg_installed:
                 installed, latest = pkg_installed, pkg_latest
+                app["package"] = package
+                label = app.get("preset") or script_name or package
+            else:
+                app.pop("package", None)
     return {
         "label": label,
         "installed": installed or None,
@@ -613,13 +676,22 @@ def cmd_untrack(cfg, args):
     save_config(cfg)
 
 
-def detect_app(entry, gid):
-    """Fill entry['app'] for community-scripts containers. Returns True if changed."""
-    code, out, _ = guest_exec("lxc", gid, DETECT_APP)
+def detect_app(entry, gid, gtype="lxc"):
+    """Fill entry['app'] for community-scripts containers and apps installed with
+    apt. Returns True if changed."""
+    code, out, _ = guest_exec(gtype, gid, DETECT_APP)
     out = out.strip()
+    if code == 0 and not out and "app" not in entry:
+        package = find_apt_app(gtype, gid, [entry.get("name", "").lower()])
+        if package:
+            entry["app"] = {"cmd": APT_APP_UPGRADE % package, "package": package}
+            say(f"    found {package} (apt package): will upgrade it as this guest's app")
+            return True
     if code != 0 or not out.startswith("community"):
         return False
     url = out.split(" ", 1)[1] if " " in out else ""
+    if not url and "app" in entry:
+        return False  # an update command that names no script; already known
     name = url.rsplit("/", 1)[-1].removesuffix(".sh")
     app = entry.setdefault("app", {"cmd": "update", "interactive": True})
     if url:
@@ -688,11 +760,14 @@ def check_guest(cfg, gid):
     # Containers that were stopped when tracked, or tracked before script
     # detection existed: detect now, unless the app step was removed on purpose.
     app = g.get("app") or {}
-    if g["type"] == "lxc" and not g.get("app_removed") and app.get("cmd", "update") == "update" and "script" not in app:
-        if detect_app(g, gid):
+    if not g.get("app_removed") and app.get("cmd", "update") == "update" and "script" not in app:
+        if detect_app(g, gid, g["type"]):
             save_config(cfg)
     if g.get("app"):
+        known = g["app"].get("package")
         res["app"] = app_version(g["type"], gid, g["app"], g["name"])
+        if g["app"].get("package") != known:
+            save_config(cfg)
     return res
 
 

@@ -48,7 +48,8 @@ Stopped guests are skipped. VMs need the QEMU guest agent installed and enabled.
 
 ## App updates
 
-- **community-scripts containers** are detected when you track them (they have `/usr/bin/update`), and `update` is run after the OS packages. `check` shows the installed version (from `/root/.<app>` or an older `/opt/<app>_version.txt`; Pi-hole and AdGuard Home are asked directly) and, for apps released on GitHub, the latest one. Apps installed with apt (MariaDB, InfluxDB, Mosquitto, Redis, Grafana...) get both versions from apt, and their `update` upgrades all of the container's packages, not just the app. Any other app without a version file shows as unknown until you give it a `--version-cmd`.
+- **community-scripts containers** are detected when you track them (they have `/usr/bin/update`), and `update` is run after the OS packages. `check` shows the installed version (from `/root/.<app>` or an older `/opt/<app>_version.txt`; Pi-hole and AdGuard Home are asked directly) and, for apps released on GitHub, the latest one. Apps installed with apt get both versions from apt, and their `update` upgrades all of the container's packages, not just the app. Any other app without a version file shows as unknown until you give it a `--version-cmd`.
+- **Other guests with an app from apt** are detected from their running services: if one non-system package provides them, or one matches the guest's name, that package is the app and its app update upgrades only that package. When it isn't clear which service is the app, the guest gets no app step; set one with `--app-cmd` and `--version-cmd`. Debian and Ubuntu guests with systemd only. `pveupdate set ID --app-cmd ''` turns the app step off for good.
 - **Your own installs**: save the command once:
 
 ```bash
