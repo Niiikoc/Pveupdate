@@ -79,6 +79,23 @@ APP_PRESETS = {
     },
 }
 
+# Prints an apt package's upstream version, without its epoch and packaging suffix.
+DPKG_VERSION = "dpkg-query -W -f='${{Version}}' {} | sed 's/^[0-9]*://; s/[-+~].*//'"
+
+# Community-scripts apps that keep no version file, by script name. The apt ones
+# have no latest version here: their updates come with the OS packages.
+COMMUNITY_APPS = {
+    "adguard": {
+        # Updates itself from its web interface, so only the binary knows its version.
+        "version_cmd": "/opt/AdGuardHome/AdGuardHome --version | sed -n 's/.*version v*//p'",
+        "github": "AdguardTeam/AdGuardHome",
+    },
+    "grafana": {"version_cmd": DPKG_VERSION.format("grafana")},
+    "mariadb": {"version_cmd": DPKG_VERSION.format("mariadb-server")},
+    "mqtt": {"version_cmd": DPKG_VERSION.format("mosquitto")},
+    "redis": {"version_cmd": DPKG_VERSION.format("redis-server")},
+}
+
 OS_CHECK = r"""
 if command -v apt-get >/dev/null; then
   export DEBIAN_FRONTEND=noninteractive
@@ -417,37 +434,42 @@ def community_app_source(script_url):
     """From a community-scripts ct script, find (version_file_name, github_repo).
 
     Their update scripts record the installed version in /root/.<app> and
-    compare it with `check_for_gh_release "<app>" "<owner/repo>"`.
+    compare it with `check_for_gh_release "<app>" "<owner/repo>"`. The repo is
+    only returned for GitHub releases, the one source of latest versions here.
     """
     body = http_get(script_url) or ""
-    m = re.search(r'check_for_gh_release\s+"([^"]+)"\s+"([^"]+)"', body)
+    m = re.search(r'check_for_(gh_release|gh_tag|gl_release|codeberg_release)\s+"([^"]+)"\s+"([^"]+)"', body)
     if m:
-        return m.group(1).lower().replace(" ", ""), m.group(2)
+        return m.group(2).lower().replace(" ", ""), m.group(3) if m.group(1) == "gh_release" else None
     name = script_url.rsplit("/", 1)[-1].removesuffix(".sh")
     return name.lower(), None
 
 
 # `pihole -v`: "Core version is v6.1.4 (Latest: v6.2.1)" (v5: "Pi-hole version is ...").
-PIHOLE_VERSION = re.compile(r"version is v?(\S+)\s+\(Latest: v?([^)\s]+)\)")
+# Off the master branch it prints "Core" and then "    Version is ..." instead.
+PIHOLE_VERSION = re.compile(r"version is v?(\S+)\s+\(Latest: v?([^)\s]+)\)", re.I)
 
 
 def app_version(gtype, gid, app, name=None):
     """Returns {label, installed, latest, update_available}; versions are None when unknown."""
-    preset = APP_PRESETS.get(app.get("preset", ""), {})
+    preset = APP_PRESETS.get(app.get("preset", "")) or COMMUNITY_APPS.get(app.get("script_name", ""), {})
     version_cmd = app.get("version_cmd") or preset.get("version_cmd")
     repo = app.get("github") or preset.get("github")
     label = app.get("preset") or app.get("script_name") or (repo or "").split("/")[-1] or name or "app"
     installed = latest = None
     if not version_cmd and app.get("script_name") == "pihole":
         # Pi-hole reports its own installed and latest version.
-        code, out, _ = guest_exec(gtype, gid, "pihole -v 2>/dev/null | head -n 1")
-        m = PIHOLE_VERSION.search(out) if code == 0 else None
+        code, out, _ = guest_exec(gtype, gid, "pihole -v 2>/dev/null")
+        m = PIHOLE_VERSION.search(out) if code == 0 else None  # the first match is Core
         if m:
-            installed, latest = m.group(1), (None if m.group(2) == "N/A" else m.group(2))
+            installed, latest = (None if v == "N/A" else v for v in m.groups())
     else:
         if not version_cmd and app.get("script"):
             vfile, gh = community_app_source(app["script"])
-            version_cmd = f"cat /root/.{vfile} 2>/dev/null"
+            # Containers not updated since community-scripts moved its version
+            # files still have /opt/<app>_version.txt; a lone one is the app's.
+            version_cmd = (f"cat /root/.{vfile} 2>/dev/null || "
+                           '{ set -- /opt/*_version.txt; [ $# = 1 ] && cat "$1" 2>/dev/null; }')
             repo = repo or gh
         if version_cmd:
             code, out, _ = guest_exec(gtype, gid, version_cmd)

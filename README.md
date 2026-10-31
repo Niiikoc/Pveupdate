@@ -48,7 +48,7 @@ Stopped guests are skipped. VMs need the QEMU guest agent installed and enabled.
 
 ## App updates
 
-- **community-scripts containers** are detected when you track them (they have `/usr/bin/update`), and `update` is run after the OS packages. `check` shows the installed version (from `/root/.<app>`) and, for apps released on GitHub, the latest one.
+- **community-scripts containers** are detected when you track them (they have `/usr/bin/update`), and `update` is run after the OS packages. `check` shows the installed version (from `/root/.<app>` or an older `/opt/<app>_version.txt`; Pi-hole, AdGuard Home, Mosquitto, MariaDB, Redis and Grafana are asked directly) and, for apps released on GitHub, the latest one. Any other app without a version file shows as unknown until you give it a `--version-cmd`.
 - **Your own installs**: save the command once:
 
 ```bash
