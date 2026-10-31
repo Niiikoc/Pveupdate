@@ -33,6 +33,7 @@ import re
 import secrets
 import shlex
 import socket
+import ssl
 import subprocess
 import sys
 import threading
@@ -45,8 +46,10 @@ STATUS_PATH = os.environ.get("PVEUPDATE_STATUS", "/var/lib/pveupdate/status.json
 LOG_PATH = os.environ.get("PVEUPDATE_LOG", "/var/log/pveupdate.log")
 LOCK_PATH = os.environ.get("PVEUPDATE_LOCK", "/run/pveupdate.lock")
 TOKEN_PATH = os.environ.get("PVEUPDATE_TOKEN", "/etc/pveupdate.token")
+CERT_PATH = os.environ.get("PVEUPDATE_CERT", "/etc/pveupdate.crt")
+KEY_PATH = os.environ.get("PVEUPDATE_KEY", "/etc/pveupdate.key")
 SNAP_PREFIX = "pveupd"
-VERSION = "0.7.1"
+VERSION = "0.8.0"
 EXEC_TIMEOUT = 3600
 
 DEFAULTS = {
@@ -61,6 +64,9 @@ DEFAULTS = {
     # RAM (MB) an LXC gets while its app update runs; apps that compile
     # (Zigbee2MQTT, Obico...) can crawl for hours in 1 GB. 0 = never change.
     "build_memory": 2048,
+    # Whether the API may change the tracked guests. Host-wide. When off, the
+    # API token only reaches the guests chosen on the host.
+    "remote_track": True,
 }
 BACKUP_NOTE = "pveupdate: before update"
 
@@ -971,6 +977,7 @@ def status_summary(cfg, st, full=False):
     running = is_locked()
     return {
         "version": VERSION,
+        "remote_track": cfg["defaults"]["remote_track"],
         "checked_at": st.get("checked_at"),
         "running": running,
         "activity": st.get("activity") if running else None,
@@ -1009,6 +1016,10 @@ def cmd_set(cfg, args):
         g = cfg["guests"][args.id]
     else:
         sys.exit(f"{args.id} is not tracked (run `track` first)")
+    if args.remote_track is not None:
+        if args.id != "default":
+            sys.exit("--remote-track applies to the whole host: use `pveupdate set default --remote-track ...`")
+        g["remote_track"] = args.remote_track == "on"
     if args.backup_fallback is not None:
         g["backup_fallback"] = args.backup_fallback == "on"
     if args.backup_storage is not None:
@@ -1043,9 +1054,11 @@ def cmd_set(cfg, args):
 # ---------------------------------------------------------------- HTTP API
 
 def load_token(create=False):
-    if os.path.exists(TOKEN_PATH):
+    try:
         with open(TOKEN_PATH) as f:
             return f.read().strip()
+    except FileNotFoundError:
+        pass
     if not create:
         return None
     token = secrets.token_urlsafe(32)
@@ -1053,6 +1066,41 @@ def load_token(create=False):
     with os.fdopen(fd, "w") as f:
         f.write(token + "\n")
     return token
+
+
+def ensure_cert():
+    """Self-signed certificate for the API, created on first use. Returns its
+    SHA-256 fingerprint in hex, or None if it can't be created."""
+    os.makedirs(os.path.dirname(LOCK_PATH), exist_ok=True)
+    # `serve` and `token` can both get here on a fresh install.
+    with open(LOCK_PATH + ".cert", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if not (os.path.exists(CERT_PATH) and os.path.exists(KEY_PATH)):
+            old_umask = os.umask(0o077)
+            try:
+                r = run(["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
+                         "-nodes", "-sha256", "-days", "36500", "-subj", "/CN=pveupdate",
+                         "-keyout", KEY_PATH, "-out", CERT_PATH], check=False)
+            except OSError:
+                return None
+            finally:
+                os.umask(old_umask)
+            if r.returncode != 0:
+                return None
+    with open(CERT_PATH) as f:
+        return hashlib.sha256(ssl.PEM_cert_to_DER_cert(f.read())).hexdigest()
+
+
+def tls_context():
+    """Server TLS context, or None if the certificate can't be set up."""
+    if not ensure_cert():
+        return None
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(CERT_PATH, KEY_PATH)
+    except (OSError, ssl.SSLError):
+        return None
+    return ctx
 
 
 def spawn(*cli_args):
@@ -1065,10 +1113,10 @@ def spawn(*cli_args):
 
 
 class ApiHandler(BaseHTTPRequestHandler):
-    token = ""
     start_lock = threading.Lock()
     last_start = 0.0
     server_version = "pveupdate"
+    timeout = 30
 
     def log_message(self, fmt, *a):
         pass
@@ -1083,8 +1131,12 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     def _authorized(self):
         auth = self.headers.get("Authorization", "")
-        given = auth[7:] if auth.startswith("Bearer ") else ""
-        if given and hmac.compare_digest(given, self.token):
+        # What `pveupdate token` prints also has the certificate's fingerprint
+        # after a dot; only the part before it is the secret.
+        given = (auth[7:] if auth.startswith("Bearer ") else "").split(".", 1)[0]
+        # Read on every request, so `pveupdate token --new` applies right away.
+        token = load_token()
+        if token and given and hmac.compare_digest(given.encode(), token.encode()):
             return True
         self._send(401, {"error": "invalid or missing token"})
         return False
@@ -1139,6 +1191,9 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     def _track(self):
         """Set the tracked guests to exactly the given list of IDs."""
+        if not load_config()["defaults"]["remote_track"]:
+            self._send(403, {"error": "tracked guests can only be changed on the host (remote_track is off)"})
+            return
         body = self._body()
         ids = (body or {}).get("guests")
         if not isinstance(ids, list):
@@ -1196,18 +1251,44 @@ class ApiHandler(BaseHTTPRequestHandler):
         self._send(202, {"started": "update", "guests": ids, "part": part})
 
 
+class ApiServer(ThreadingHTTPServer):
+    """HTTPS, and on the same port plain HTTP for integrations set up before 0.8.0."""
+
+    tls = None
+
+    def finish_request(self, request, client_address):
+        # Runs in the connection's own thread, so a slow client holds up nobody else.
+        request.settimeout(ApiHandler.timeout)
+        secure = False
+        try:
+            # 0x16 starts a TLS handshake; plain HTTP starts with a method name.
+            if self.tls and request.recv(1, socket.MSG_PEEK) == b"\x16":
+                request = self.tls.wrap_socket(request, server_side=True)
+                secure = True
+        except OSError:  # includes failed handshakes and timeouts
+            return
+        try:
+            super().finish_request(request, client_address)
+        finally:
+            if secure:
+                request.close()
+
+
 def cmd_serve(cfg, args):
-    token = load_token(create=True)
-    ApiHandler.token = token
-    server = ThreadingHTTPServer((args.bind, args.port), ApiHandler)
-    print(f"pveupdate API listening on {args.bind}:{args.port} (token in {TOKEN_PATH})", flush=True)
+    load_token(create=True)
+    server = ApiServer((args.bind, args.port), ApiHandler)
+    server.tls = tls_context()
+    mode = "HTTPS and HTTP" if server.tls else "HTTP only, could not set up a certificate"
+    print(f"pveupdate API listening on {args.bind}:{args.port}, {mode} (token in {TOKEN_PATH})", flush=True)
     server.serve_forever()
 
 
 def cmd_token(cfg, args):
     if args.new and os.path.exists(TOKEN_PATH):
         os.remove(TOKEN_PATH)
-    print(load_token(create=True))
+    token = load_token(create=True)
+    fingerprint = ensure_cert()
+    print(f"{token}.{fingerprint}" if fingerprint else token)
 
 
 def menu(cfg):
@@ -1253,7 +1334,7 @@ def main():
     psv = sub.add_parser("serve", help="run the HTTP API for the Home Assistant integration")
     psv.add_argument("--bind", default="0.0.0.0")
     psv.add_argument("--port", type=int, default=8765)
-    ptk = sub.add_parser("token", help="print the API token (created on first use)")
+    ptk = sub.add_parser("token", help="print the API token and certificate fingerprint (created on first use)")
     ptk.add_argument("--new", action="store_true", help="replace the token with a new one")
     pst = sub.add_parser("status", help="show the last check/update results")
     pst.add_argument("--json", action="store_true")
@@ -1261,6 +1342,8 @@ def main():
     ps = sub.add_parser("set", help="change a tracked guest's settings")
     ps.add_argument("id", help="guest ID, or `default` for all guests")
     ps.add_argument("--snapshot", choices=["on", "off"])
+    ps.add_argument("--remote-track", choices=["on", "off"],
+                    help="let the API change the tracked guests (default on; only with `default`)")
     ps.add_argument("--backup-fallback", choices=["on", "off"],
                     help="take a vzdump backup when a snapshot isn't possible (default on)")
     ps.add_argument("--backup-storage", help="storage for fallback backups ('' = auto)")
